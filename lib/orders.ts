@@ -1,3 +1,8 @@
+// lib/orders.ts
+//
+// Writes confirmed orders to the Orders tab. That sheet is the
+// admin dashboard — the shop owner sets status by hand.
+
 import { appendRow } from './sheets';
 import type { ExtractedOrder } from './extract';
 
@@ -8,7 +13,7 @@ export async function saveOrder(
   const orderNo = `ORD-${Date.now().toString(36).toUpperCase()}`;
 
   const items = order.items
-    .map(i => `${i.title} ${i.color} ${i.size} x${i.qty}`)
+    .map(i => `${i.title} ${i.color} ${i.size} x${i.qty}`.replace(/\s+/g, ' ').trim())
     .join(' | ');
 
   await appendRow('Orders', [
@@ -17,7 +22,7 @@ export async function saveOrder(
     items,
     order.total,
     'pending_payment',
-    '',                 // slip_url — filled later
+    '',            // slip_url — filled in later
     orderNo,
   ]);
 

@@ -1,23 +1,21 @@
 // lib/sheets.ts
 //
-// Google Sheets as the database. Chosen because the shop owner can edit
-// it directly — the sheet IS the admin dashboard, so there's no UI to build
-// and nothing new to learn.
+// Google Sheets as the database. Chosen because the shop owner edits it
+// directly — the sheet IS the admin dashboard, so there's no UI to build.
 //
-// Constraints worth remembering:
-//   - Roughly 60 writes per minute. Fine for products and orders,
-//     far too slow for per-message conversation history.
-//   - No transactions and no unique constraints. Two events arriving
-//     together can produce duplicate rows. Acceptable where a human
-//     reviews the data anyway; not acceptable for anything automated.
-//   - Every call is a network round trip (200-500ms). Cache reads.
+// Constraints:
+//   - ~60 writes/minute. Fine for products and orders, far too slow
+//     for per-message conversation history.
+//   - No transactions, no unique constraints. Duplicate rows are
+//     possible. Acceptable where a human reviews the data anyway.
+//   - Every call is a network round trip. Cache reads.
 
 import { google } from 'googleapis';
 
 function getAuth() {
   return new google.auth.JWT({
     email: process.env.GOOGLE_SERVICE_EMAIL,
-    // .env files store newlines as the two characters \n — restore them,
+    // .env stores newlines as the two characters \n — restore them,
     // or the key fails to parse with a DECODER error.
     key: process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
     scopes: ['https://www.googleapis.com/auth/spreadsheets'],
@@ -27,23 +25,12 @@ function getAuth() {
 const sheets = google.sheets({ version: 'v4', auth: getAuth() });
 const SHEET_ID = process.env.GOOGLE_SHEET_ID!;
 
-/* ─────────────────────────────────────────────────────────────
-   Reading
-   ───────────────────────────────────────────────────────────── */
-
-/** Raw rows from a tab, excluding the header row. */
-export async function readRows(tab: string): Promise<string[][]> {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${tab}!A2:Z`,
-  });
-  return res.data.values ?? [];
-}
+/* ── Reading ────────────────────────────────────────────────── */
 
 /**
- * A tab as objects keyed by header name.
- * Safer than readRows — reordering columns in the sheet won't
- * silently break your code.
+ * A tab as objects keyed by header name. Safer than raw rows —
+ * reordering columns in the sheet won't silently break the code,
+ * which matters when the sheet is also the UI someone edits.
  */
 export async function readTable(tab: string): Promise<Record<string, string>[]> {
   const res = await sheets.spreadsheets.values.get({
@@ -62,11 +49,8 @@ export async function readTable(tab: string): Promise<Record<string, string>[]> 
   );
 }
 
-/* ─────────────────────────────────────────────────────────────
-   Writing
-   ───────────────────────────────────────────────────────────── */
+/* ── Writing ────────────────────────────────────────────────── */
 
-/** Append one row to the bottom of a tab. */
 export async function appendRow(tab: string, row: (string | number)[]) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
@@ -76,42 +60,20 @@ export async function appendRow(tab: string, row: (string | number)[]) {
   });
 }
 
-/** Append several rows in a single API call. Use this over a loop. */
 export async function appendRows(tab: string, rows: (string | number)[][]) {
   if (rows.length === 0) return;
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
     range: `${tab}!A:Z`,
     valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [rows].flat() },
+    requestBody: { values: rows },
   });
 }
 
-/**
- * Overwrite a single cell.
- * rowIndex is 0-based over DATA rows, so 0 is the first row under
- * the header, which is spreadsheet row 2.
- */
-export async function updateCell(
-  tab: string,
-  rowIndex: number,
-  column: string,
-  value: string | number
-) {
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: `${tab}!${column}${rowIndex + 2}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: { values: [[value]] },
-  });
-}
-
-/* ─────────────────────────────────────────────────────────────
-   Cached reads
-
-   Products are read on every customer message. Without a cache
-   that's a network round trip per message, and you'd hit the
-   rate limit with a handful of simultaneous conversations.
+/* ── Cached reads ───────────────────────────────────────────────
+   Products are read on every customer message. Without caching
+   that's a network round trip per message, and a handful of
+   simultaneous conversations would hit the rate limit.
    ───────────────────────────────────────────────────────────── */
 
 type CacheEntry = { data: Record<string, string>[]; at: number };
@@ -132,21 +94,17 @@ export async function readTableCached(
   } catch (err) {
     console.error(`Sheet read failed for "${tab}":`, err);
     // Serve stale data rather than breaking the conversation.
-    // Sheets is not a reliable database — a failed read should
-    // degrade the answer, not kill the reply.
+    // A failed read should degrade the answer, not kill the reply.
     return hit?.data ?? [];
   }
 }
 
-/** Drop the cache — call after a sync so new rows appear immediately. */
 export function invalidateCache(tab?: string) {
   if (tab) cache.delete(tab);
   else cache.clear();
 }
 
-/* ─────────────────────────────────────────────────────────────
-   Health check
-   ───────────────────────────────────────────────────────────── */
+/* ── Health check ───────────────────────────────────────────── */
 
 export async function checkConnection(): Promise<{
   ok: boolean;

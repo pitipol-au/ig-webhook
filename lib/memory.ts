@@ -1,7 +1,8 @@
 // lib/memory.ts
 //
-// Everything here lives in memory and is cleared when the dev server
-// restarts. That's fine for now — Supabase replaces this later.
+// Conversation history and handover state, held in memory.
+// Cleared on every restart — including customers mid-order.
+// This is the largest known limitation of the current build.
 
 type Turn = { role: 'user' | 'model'; text: string };
 
@@ -10,6 +11,20 @@ const takenOver = new Set<string>();
 const botSent = new Set<string>();
 
 const MAX_TURNS = 20;
+
+const ordered = new Set<string>();
+
+export function hasOrdered(senderId: string): boolean {
+  return ordered.has(senderId);
+}
+
+export function markOrdered(senderId: string) {
+  ordered.add(senderId);
+}
+
+export function clearOrdered(senderId: string) {
+  ordered.delete(senderId);
+}
 
 /* ── Conversation history ───────────────────────────────────── */
 
@@ -41,9 +56,7 @@ export function releaseToBot(senderId: string) {
 /* ── Recognising our own echoes ─────────────────────────────
    Instagram echoes every outbound message back to the webhook,
    including ones the bot sent. Without this the bot sees its own
-   reply, thinks a human typed it, and silences itself.
-   Matching on text is crude but works because replies are unique
-   enough. Switch to matching on message_id once we have Supabase.
+   reply, assumes a human typed it, and silences itself.
    ───────────────────────────────────────────────────────────── */
 
 export function markBotSent(text: string) {
