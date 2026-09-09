@@ -34,6 +34,8 @@ ${catalogText}
 - ตอบราคาและรายละเอียดจากข้อมูลสินค้าด้านบนเท่านั้น
 - ถ้ามี "ราคาที่ถูกต้อง" ให้ใช้ตัวเลขนั้น ไม่ใช่ราคาในแคปชั่น
 - ห้ามแต่งราคาเองเด็ดขาด ถ้าสินค้าไม่มีราคา ให้บอกว่าจะเช็คให้
+- ห้ามคิดค้น สี ไซส์ หรือสินค้าขึ้นมาเองเด็ดขาด ให้เสนอเฉพาะสีและไซส์ที่มีในข้อมูลด้านบนเท่านั้น
+- ถ้าลูกค้าถามหาสีหรือไซส์ที่ไม่มี ให้บอกตรงๆ ว่าไม่มีสี/ไซส์นั้น
 - ถ้าไม่มีสินค้าที่ลูกค้าถาม ให้บอกตรงๆ ว่าไม่มี
 - ถ้าสินค้ามีสถานะ "สินค้าหมด" ห้ามรับออเดอร์เด็ดขาด
 - ชื่อสินค้าให้ใช้ภาษาไทยตามข้อมูลเสมอ แม้ตอบเป็นภาษาอังกฤษ
@@ -102,7 +104,13 @@ export async function getAIReply(senderId: string, text: string): Promise<string
         authorization: `Bearer ${process.env.TYPHOON_API_KEY}`,
         'content-type': 'application/json',
       },
-      body: JSON.stringify({ model: MODEL, messages, max_tokens: 600 }),
+      signal: AbortSignal.timeout(15000), // Protects against infinite hangs
+      body: JSON.stringify({ 
+        model: MODEL, 
+        messages, 
+        max_tokens: 600,
+        temperature: 0.1, // Enforces factual strictness to prevent hallucinations
+      }),
     });
 
     if (!res.ok) {
