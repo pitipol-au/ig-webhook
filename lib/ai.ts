@@ -13,6 +13,24 @@ const SHIPPING_THB = Number(process.env.SHIPPING_THB ?? 40);
 const FALLBACK_TH = 'ขอโทษค่ะ ระบบขัดข้อง เดี๋ยวแอดมินมาตอบนะคะ';
 const FALLBACK_EN = 'Sorry, something went wrong. Our admin will reply shortly.';
 
+/**
+ * Which language to reply in.
+ *
+ * Typhoon is Thai-specialised and defaults to Thai unless pushed.
+ * A short English message like "Hi" carries little signal against a
+ * system prompt written entirely in Thai, so we decide in code and
+ * tell the model outright rather than hoping a prompt rule holds.
+ *
+ * No letters at all (emoji, digits) defaults to Thai — most
+ * customers are Thai, so that's the better guess.
+ */
+function detectLang(text: string): 'th' | 'en' {
+  const thai = (text.match(/[\u0e00-\u0e7f]/g) ?? []).length;
+  const latin = (text.match(/[a-zA-Z]/g) ?? []).length;
+  if (thai > 0) return 'th';
+  return latin > 0 ? 'en' : 'th';
+}
+
 function buildSystemPrompt(catalogText: string): string {
   return `คุณเป็นแอดมินร้านขายเสื้อผ้าออนไลน์บน Instagram
 
@@ -23,19 +41,10 @@ function buildSystemPrompt(catalogText: string): string {
 สินค้าทั้งหมดในร้าน:
 ${catalogText}
 
-กฎเรื่องภาษา:
-- ตอบด้วยภาษาเดียวกับที่ลูกค้าใช้
-- ลูกค้าพิมพ์ไทย → ตอบไทย ใช้ "ค่ะ/นะคะ"
-- ลูกค้าพิมพ์อังกฤษ → ตอบอังกฤษ สุภาพ เป็นกันเอง
-- ลูกค้าพิมพ์ปนกัน → ตอบภาษาที่เป็นส่วนใหญ่
-- ถ้าลูกค้าเปลี่ยนภาษากลางบทสนทนา ให้เปลี่ยนตาม
-
 กฎเรื่องข้อมูลสินค้า:
 - ตอบราคาและรายละเอียดจากข้อมูลสินค้าด้านบนเท่านั้น
 - ถ้ามี "ราคาที่ถูกต้อง" ให้ใช้ตัวเลขนั้น ไม่ใช่ราคาในแคปชั่น
 - ห้ามแต่งราคาเองเด็ดขาด ถ้าสินค้าไม่มีราคา ให้บอกว่าจะเช็คให้
-- ห้ามคิดค้น สี ไซส์ หรือสินค้าขึ้นมาเองเด็ดขาด ให้เสนอเฉพาะสีและไซส์ที่มีในข้อมูลด้านบนเท่านั้น
-- ถ้าลูกค้าถามหาสีหรือไซส์ที่ไม่มี ให้บอกตรงๆ ว่าไม่มีสี/ไซส์นั้น
 - ถ้าไม่มีสินค้าที่ลูกค้าถาม ให้บอกตรงๆ ว่าไม่มี
 - ถ้าสินค้ามีสถานะ "สินค้าหมด" ห้ามรับออเดอร์เด็ดขาด
 - ชื่อสินค้าให้ใช้ภาษาไทยตามข้อมูลเสมอ แม้ตอบเป็นภาษาอังกฤษ
@@ -47,6 +56,8 @@ ${catalogText}
 - สินค้า freesize ไม่ต้องถามไซส์
 - สินค้าที่ไม่ได้ระบุสี ไม่ต้องถามสี
 - ตอบสั้น 2-3 ประโยค ยกเว้นตอนสรุปคำสั่งซื้อ
+- ห้ามระบุเวลาที่แน่นอน เช่น "ไม่กี่วินาที" "5 นาที"
+  ให้บอกกว้างๆ ว่าแอดมินจะติดต่อกลับ
 
 กฎการสรุปคำสั่งซื้อ (ทำตามรูปแบบนี้เท่านั้น):
 
@@ -60,7 +71,7 @@ ${catalogText}
 - "ยอดรวมทั้งหมด" คือตัวเลขสุดท้ายที่รวมค่าส่งแล้ว ห้ามบวกค่าส่งซ้ำ
 - ต้องแสดงการคูณให้เห็นชัด เช่น 590 x 2 = 1180
 - ห้ามสรุปยอดถ้าข้อมูลยังไม่ครบ 4 อย่าง
-- ถ้าลูกค้าใช้ภาษาอังกฤษ ให้แปลรูปแบบนี้เป็นอังกฤษ คงตัวเลขและโครงสร้างเดิม
+- ถ้าตอบเป็นภาษาอังกฤษ ให้แปลรูปแบบนี้เป็นอังกฤษ คงตัวเลขและโครงสร้างเดิม
 
 กฎหลังลูกค้ายืนยัน:
 - ตอบสั้นๆ สื่อว่า (1) รับออเดอร์แล้ว (2) ขั้นตอนถัดไปคือชำระเงิน แอดมินจะส่งช่องทางให้
@@ -77,14 +88,12 @@ ${catalogText}
 
 /** Backstop for artefacts the prompt doesn't reliably prevent. */
 function clean(text: string): string {
-  return text
-    .replace(/<think>[\s\S]*?<\/think>/g, '')
-    .trim();
+  return text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }
 
-const isThai = (s: string) => /[\u0e00-\u0e7f]/.test(s);
-
 export async function getAIReply(senderId: string, text: string): Promise<string> {
+  const lang = detectLang(text);
+
   try {
     const catalogText = await getFormattedCatalog();
     const history = getHistory(senderId);
@@ -96,6 +105,16 @@ export async function getAIReply(senderId: string, text: string): Promise<string
         content: t.text,
       })),
       { role: 'user', content: text },
+      // Injected LAST, immediately before generation — a system message
+      // here outweighs a rule buried in a long Thai prompt above.
+      {
+        role: 'system',
+        content:
+          lang === 'en'
+            ? 'IMPORTANT: The customer wrote in English. Reply in ENGLISH only. ' +
+              'Do not use Thai. Keep Thai product names as they are.'
+            : 'สำคัญ: ลูกค้าพิมพ์ภาษาไทย ให้ตอบเป็นภาษาไทยเท่านั้น ใช้ "ค่ะ/นะคะ"',
+      },
     ];
 
     const res = await fetch(API_URL, {
@@ -104,13 +123,7 @@ export async function getAIReply(senderId: string, text: string): Promise<string
         authorization: `Bearer ${process.env.TYPHOON_API_KEY}`,
         'content-type': 'application/json',
       },
-      signal: AbortSignal.timeout(15000), // Protects against infinite hangs
-      body: JSON.stringify({ 
-        model: MODEL, 
-        messages, 
-        max_tokens: 600,
-        temperature: 0.1, // Enforces factual strictness to prevent hallucinations
-      }),
+      body: JSON.stringify({ model: MODEL, messages, max_tokens: 600 }),
     });
 
     if (!res.ok) {
@@ -128,6 +141,6 @@ export async function getAIReply(senderId: string, text: string): Promise<string
   } catch (err) {
     console.error('AI error:', err);
     // Apologise in the customer's own language
-    return isThai(text) ? FALLBACK_TH : FALLBACK_EN;
+    return lang === 'en' ? FALLBACK_EN : FALLBACK_TH;
   }
 }
