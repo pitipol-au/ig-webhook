@@ -10,6 +10,7 @@ const conversations = new Map<string, Turn[]>();
 const takenOver = new Set<string>();
 const botSent = new Set<string>();
 const ordered = new Set<string>();
+const langs = new Map<string, 'th' | 'en'>();
 
 const MAX_TURNS = 20;
 
@@ -24,6 +25,25 @@ export function addTurn(senderId: string, role: 'user' | 'model', text: string) 
   history.push({ role, text });
   if (history.length > MAX_TURNS) history.shift();
   conversations.set(senderId, history);
+}
+
+/* ── Conversation language ──────────────────────────────────
+   Set once, on first contact, then fixed for the thread.
+   Per-message detection is fragile: a Thai customer typing "ok"
+   has no Thai characters and would flip the whole reply to
+   English mid-order.
+   ───────────────────────────────────────────────────────────── */
+
+export function getLang(senderId: string): 'th' | 'en' | null {
+  return langs.get(senderId) ?? null;
+}
+
+export function setLang(senderId: string, lang: 'th' | 'en') {
+  if (!langs.has(senderId)) langs.set(senderId, lang);   // first contact wins
+}
+
+export function clearLang(senderId: string) {
+  langs.delete(senderId);
 }
 
 /* ── Human handover ─────────────────────────────────────────── */

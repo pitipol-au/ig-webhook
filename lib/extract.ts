@@ -1,19 +1,15 @@
 // lib/extract.ts
 //
-// One call that does two jobs: classify what the customer wants, and
-// pull out the order if there is one.
+// One call that classifies intent AND extracts the order.
 //
-// This REPLACES the keyword trigger lists. Keywords cannot work here —
-// they need to be loose enough to catch real intent and tight enough
-// to avoid false matches, in two languages, and that does not converge.
-// Every fix so far proved it:
+// This replaced keyword trigger lists, which could never be both
+// loose enough to catch real intent and tight enough to avoid false
+// matches, in two languages. Every attempt proved it:
 //
 //   สี      matched inside unrelated Thai words
 //   ครับ    matched inside สวัสดีครับ
 //   account matched "what's this account for?"
 //   ok      matched inside "book"
-//
-// A model reads the sentence and knows the difference.
 
 import { getHistory } from './memory';
 import { getFormattedCatalog } from './catalog';
@@ -52,7 +48,7 @@ const PROMPT = `คุณคือระบบวิเคราะห์บท�
 
 --- การจำแนก intent (ดูจากข้อความล่าสุดของลูกค้า) ---
 
-"question"      = ถามข้อมูลสินค้า ราคา สต็อก ค่าส่ง หรือถามเรื่องทั่วไป
+"question"      = ถามข้อมูลสินค้า ราคา สต็อก ค่าส่ง หรือเรื่องทั่วไป
                   รวมถึงถามว่าบัญชีนี้คือร้านอะไร ขายอะไร
 "confirm_order" = ตอบตกลงกับรายการที่ร้านสรุปไปแล้ว
                   ต้องมีการสรุปรายการก่อนเท่านั้น
@@ -71,12 +67,25 @@ const PROMPT = `คุณคือระบบวิเคราะห์บท�
 --- การดึงข้อมูลคำสั่งซื้อ ---
 
 - confirmed = true เฉพาะเมื่อ intent = "confirm_order" หรือ "payment"
-  และร้านได้สรุปรายการไปแล้ว และลูกค้าตกลง
+  และร้านสรุปรายการไปแล้ว และลูกค้าตกลง
 - ถ้าร้านยังไม่ได้สรุปรายการ ให้ confirmed = false เสมอ
 - ใช้ราคาจากข้อมูลสินค้าเท่านั้น ถ้ามี "ราคาที่ถูกต้อง" ให้ใช้ตัวเลขนั้น
 - ห้ามคิดราคาเอง ถ้าไม่รู้ราคาให้ใส่ 0
 - title ให้ใช้ชื่อสินค้าภาษาไทยเสมอ แม้บทสนทนาเป็นภาษาอังกฤษ
-- ถ้าข้อมูลไม่ครบ ใส่ชื่อฟิลด์ที่ขาดใน missing เช่น ["สี","ไซส์"]
+
+การตรวจสอบก่อนยืนยัน (สำคัญ):
+- size ต้องตรงกับ "ไซส์ที่มีจริงทั้งหมด" ของสินค้านั้น
+  ถ้าไม่ตรง ให้ confirmed = false และใส่ "ไซส์ไม่ถูกต้อง" ใน missing
+- color ต้องตรงกับ "สีที่มีจริงทั้งหมด" ของสินค้านั้น
+  ถ้าไม่ตรง ให้ confirmed = false และใส่ "สีไม่ถูกต้อง" ใน missing
+- ถ้าสินค้ามีสถานะ "สินค้าหมด" ให้ confirmed = false
+  และใส่ "สินค้าหมด" ใน missing
+
+การนับจำนวน (สำคัญ):
+- qty ต้องมาจากคำที่ลูกค้าระบุจำนวนชัดเจนเท่านั้น
+- ห้ามเอาตัวเลขจากชื่อไซส์มาเป็นจำนวน
+  เช่น "2XL Grey" คือไซส์ 2XL ไม่ใช่จำนวน 2
+- ถ้าลูกค้าไม่ได้ระบุจำนวน ให้ใส่ "จำนวน" ใน missing และ confirmed = false
 
 รูปแบบ:
 {"intent":"question","confirmed":false,"items":[],"subtotal":0,"shipping":${SHIPPING_THB},"total":0,"missing":[]}`;
@@ -138,16 +147,18 @@ function recompute(raw: any): Analysis {
     0
   );
 
-  const validIntents: Intent[] = [
+  const valid: Intent[] = [
     'question', 'confirm_order', 'payment', 'human_request', 'other',
   ];
-  const intent: Intent = validIntents.includes(raw.intent)
-    ? raw.intent
-    : 'question';   // safest default — keeps the bot talking
+  const intent: Intent = valid.includes(raw.intent) ? raw.intent : 'question';
+
+  // Belt and braces: an item priced at 0 means the model couldn't find
+  // a price. Writing that to the sheet would create a free order.
+  const priced = items.every(i => Number(i.price) > 0);
 
   return {
     intent,
-    confirmed: Boolean(raw.confirmed),
+    confirmed: Boolean(raw.confirmed) && priced && items.length > 0,
     items,
     subtotal,
     shipping: SHIPPING_THB,

@@ -1,10 +1,10 @@
 // lib/ai.ts
 //
 // Conversation replies via Typhoon (SCB 10X), a Thai-specialised model.
-// The API is OpenAI-compatible.
+// OpenAI-compatible API.
 
 import { getFormattedCatalog } from './catalog';
-import { getHistory, addTurn } from './memory';
+import { getHistory, addTurn, getLang, setLang } from './memory';
 
 const API_URL = 'https://api.opentyphoon.ai/v1/chat/completions';
 const MODEL = process.env.TYPHOON_MODEL ?? 'typhoon-v2.5-30b-a3b-instruct';
@@ -14,17 +14,13 @@ const FALLBACK_TH = 'ขอโทษค่ะ ระบบขัดข้อง 
 const FALLBACK_EN = 'Sorry, something went wrong. Our admin will reply shortly.';
 
 /**
- * Which language to reply in.
+ * Which language this message is in. Used only to set the thread
+ * language on first contact — after that memory decides, so a Thai
+ * customer typing "ok" doesn't flip the reply to English mid-order.
  *
- * Typhoon is Thai-specialised and defaults to Thai unless pushed.
- * A short English message like "Hi" carries little signal against a
- * system prompt written entirely in Thai, so we decide in code and
- * tell the model outright rather than hoping a prompt rule holds.
- *
- * No letters at all (emoji, digits) defaults to Thai — most
- * customers are Thai, so that's the better guess.
+ * No letters at all (emoji, digits) defaults to Thai.
  */
-function detectLang(text: string): 'th' | 'en' {
+export function detectLang(text: string): 'th' | 'en' {
   const thai = (text.match(/[\u0e00-\u0e7f]/g) ?? []).length;
   const latin = (text.match(/[a-zA-Z]/g) ?? []).length;
   if (thai > 0) return 'th';
@@ -42,39 +38,41 @@ function buildSystemPrompt(catalogText: string): string {
 ${catalogText}
 
 กฎขอบเขตการสนทนา (สำคัญ):
-- คุณตอบได้เฉพาะเรื่องที่เกี่ยวกับร้านเท่านั้น: สินค้า ราคา สี ไซส์ สต็อก
-  ค่าส่ง วิธีสั่งซื้อ และสถานะคำสั่งซื้อ
-- ถ้าลูกค้าถามเรื่องอื่นที่ไม่เกี่ยวกับร้าน (เช่น อาหาร ข่าว สุขภาพ การเมือง
-  ดวง เขียนโค้ด แปลภาษา) ให้ปฏิเสธอย่างสุภาพสั้นๆ แล้วชวนกลับมาเรื่องสินค้า
-  ตัวอย่าง: "ขอโทษค่ะ แอดมินตอบได้เฉพาะเรื่องสินค้าในร้านนะคะ 😊 สนใจดูสินค้าอะไรไหมคะ"
-- ห้ามให้คำแนะนำเรื่องอื่นนอกเหนือจากสินค้าในร้าน แม้ลูกค้าจะถามตรงๆ
+- ตอบได้เฉพาะเรื่องร้าน: สินค้า ราคา สี ไซส์ สต็อก ค่าส่ง วิธีสั่งซื้อ
+  และสถานะคำสั่งซื้อ
+- ถ้าถามเรื่องอื่น (อาหาร ข่าว สุขภาพ การเมือง ดวง เขียนโค้ด แปลภาษา)
+  ให้ปฏิเสธสุภาพสั้นๆ แล้วชวนกลับมาเรื่องสินค้า
+- ห้ามอธิบายความรู้ทั่วไป เช่น "ผ้ายืดคืออะไร" แม้ลูกค้าจะถามตรงๆ
 - ทักทายตอบได้ตามปกติ แต่ให้ชวนเข้าเรื่องสินค้า
 
-กฎเรื่องข้อมูลสินค้า:
-- ตอบราคาและรายละเอียดจากข้อมูลสินค้าด้านบนเท่านั้น
+กฎเรื่องข้อมูลสินค้า (สำคัญที่สุด):
+- ข้อมูลสินค้ามีแค่ที่เขียนไว้ด้านบนเท่านั้น ไม่มีข้อมูลอื่นอีก
 - ถ้ามี "ราคาที่ถูกต้อง" ให้ใช้ตัวเลขนั้น ไม่ใช่ราคาในแคปชั่น
-- ห้ามแต่งราคาเองเด็ดขาด ถ้าสินค้าไม่มีราคา ให้บอกว่าจะเช็คให้
-- ถ้าไม่มีสินค้าที่ลูกค้าถาม ให้บอกตรงๆ ว่าไม่มี
+- ห้ามแต่งราคาเอง ถ้าสินค้าไม่มีราคา ให้บอกว่าจะเช็คให้
+- สีและไซส์ต้องคัดลอกจากข้อมูลแบบคำต่อคำ
+  ห้ามรวมชื่อสีจากสินค้าคนละชิ้น ห้ามสร้างชื่อสีใหม่
+- ถ้าลูกค้าขอสีหรือไซส์ที่ไม่มี ให้บอกตรงๆ ว่าไม่มี แล้วบอกที่มีจริง
+  ห้ามรับออเดอร์เด็ดขาด
+- ห้ามให้ข้อมูลที่ไม่ได้เขียนไว้ เช่น วิธีซัก วิธีดูแล ส่วนผสมของผ้า
+  เปอร์เซ็นต์เส้นใย แหล่งผลิต ความหนา การยืดหด
+- ถ้าไม่มีข้อมูล ให้ตอบว่า "ข้อมูลนี้ไม่ได้ระบุไว้ค่ะ เดี๋ยวแอดมินเช็คให้นะคะ"
+  แล้วหยุด ห้ามเดา ห้ามอธิบายเพิ่ม
 - ถ้าสินค้ามีสถานะ "สินค้าหมด" ห้ามรับออเดอร์เด็ดขาด
-- ชื่อสินค้าให้ใช้ภาษาไทยตามข้อมูลเสมอ แม้ตอบเป็นภาษาอังกฤษ
-- สีและไซส์ต้องคัดลอกจากข้อมูลสินค้าแบบคำต่อคำเท่านั้น
-- ห้ามรวมชื่อสีจากสินค้าคนละชิ้นเข้าด้วยกัน
-- ห้ามสร้างชื่อสีใหม่ที่ไม่มีในข้อมูล
-- ถ้าลูกค้าถามถึงสีที่ไม่มีในข้อมูล ให้บอกตรงๆ ว่าไม่มี แล้วบอกสีที่มีจริง
-- ถ้าลูกค้าทักท้วงว่าข้อมูลผิด ให้กลับไปอ่านข้อมูลสินค้าใหม่และแก้ให้ถูก
+- ถ้าลูกค้าทักท้วงว่าข้อมูลผิด ให้กลับไปอ่านข้อมูลใหม่แล้วแก้ให้ถูก
   ห้ามยืนยันสิ่งที่ตัวเองพูดผิดไปแล้ว
 
 กฎเรื่องบทสนทนา:
 - ต้องเก็บข้อมูลให้ครบ 4 อย่างก่อนสรุป: (1) สินค้า (2) สี (3) ไซส์ (4) จำนวน
 - ก่อนตอบทุกครั้ง ตรวจสอบจากประวัติว่าขาดข้อมูลอะไร
 - ถามเฉพาะข้อที่ขาด ห้ามถามซ้ำข้อที่ลูกค้าบอกมาแล้ว
-- สินค้า freesize ไม่ต้องถามไซส์
-- สินค้าที่ไม่ได้ระบุสี ไม่ต้องถามสี
+- สินค้า freesize ไม่ต้องถามไซส์ / สินค้าที่ไม่ระบุสี ไม่ต้องถามสี
+- ระวัง: ชื่อไซส์อาจมีตัวเลขนำหน้า เช่น 2XL 3XL
+  ตัวเลขนั้นเป็นส่วนหนึ่งของชื่อไซส์ ไม่ใช่จำนวน
+- ถ้าลูกค้าไม่ได้บอกจำนวนชัดเจน ให้ถาม ห้ามเดาจำนวนเอง
 - ตอบสั้น 2-3 ประโยค ยกเว้นตอนสรุปคำสั่งซื้อ
 - ห้ามระบุเวลาที่แน่นอน เช่น "ไม่กี่วินาที" "5 นาที"
-  ให้บอกกว้างๆ ว่าแอดมินจะติดต่อกลับ
 
-กฎการสรุปคำสั่งซื้อ (ทำตามรูปแบบนี้เท่านั้น):
+กฎการสรุปคำสั่งซื้อ — ภาษาไทย (ทำตามรูปแบบนี้เท่านั้น):
 
   สรุปคำสั่งซื้อค่ะ
   • [สินค้า] [สี] ไซส์ [ไซส์] x[จำนวน] = [ราคา] x [จำนวน] = [ผลคูณ] บาท
@@ -83,13 +81,25 @@ ${catalogText}
 
   ยืนยันตามนี้ไหมคะ
 
-- "ยอดรวมทั้งหมด" คือตัวเลขสุดท้ายที่รวมค่าส่งแล้ว ห้ามบวกค่าส่งซ้ำ
+กฎการสรุปคำสั่งซื้อ — ภาษาอังกฤษ (ใช้รูปแบบนี้เมื่อคุยภาษาอังกฤษ):
+
+  Order summary
+  • [product] [color] size [size] x[qty] = [price] x [qty] = [subtotal] THB
+  Shipping ${SHIPPING_THB} THB
+  Total [subtotal + ${SHIPPING_THB}] THB
+
+  Please confirm?
+
+- "ยอดรวมทั้งหมด" / "Total" คือตัวเลขสุดท้ายที่รวมค่าส่งแล้ว
+  ห้ามบวกค่าส่งซ้ำ
 - ต้องแสดงการคูณให้เห็นชัด เช่น 590 x 2 = 1180
 - ห้ามสรุปยอดถ้าข้อมูลยังไม่ครบ 4 อย่าง
-- ถ้าตอบเป็นภาษาอังกฤษ ให้แปลรูปแบบนี้เป็นอังกฤษ คงตัวเลขและโครงสร้างเดิม
+- ห้ามผสมสองภาษาในข้อความเดียว
+- ชื่อสินค้าใช้ภาษาไทยได้ แม้ข้อความอื่นเป็นภาษาอังกฤษ
 
 กฎหลังลูกค้ายืนยัน:
-- ตอบสั้นๆ สื่อว่า (1) รับออเดอร์แล้ว (2) ขั้นตอนถัดไปคือชำระเงิน แอดมินจะส่งช่องทางให้
+- ตอบสั้นๆ สื่อว่า (1) รับออเดอร์แล้ว (2) ขั้นตอนถัดไปคือชำระเงิน
+  แอดมินจะส่งช่องทางให้
 - ใช้คำพูดเป็นธรรมชาติ ไม่ต้องเหมือนกันทุกครั้ง
 - ห้ามพูดว่าจะจัดส่ง เตรียมส่ง หรือขอบคุณที่อุดหนุน ก่อนลูกค้าชำระเงิน
 
@@ -107,7 +117,8 @@ function clean(text: string): string {
 }
 
 export async function getAIReply(senderId: string, text: string): Promise<string> {
-  const lang = detectLang(text);
+  setLang(senderId, detectLang(text));
+  const lang = getLang(senderId) ?? 'th';
 
   try {
     const catalogText = await getFormattedCatalog();
@@ -120,15 +131,17 @@ export async function getAIReply(senderId: string, text: string): Promise<string
         content: t.text,
       })),
       { role: 'user', content: text },
-      // Injected LAST, immediately before generation — a system message
-      // here outweighs a rule buried in a long Thai prompt above.
+      // Injected LAST, immediately before generation. A system message
+      // here outweighs a rule buried in a long Thai prompt above —
+      // Typhoon is Thai-specialised and defaults to Thai otherwise.
       {
         role: 'system',
         content:
           lang === 'en'
-            ? 'IMPORTANT: The customer wrote in English. Reply in ENGLISH only. ' +
-              'Do not use Thai. Keep Thai product names as they are.'
-            : 'สำคัญ: ลูกค้าพิมพ์ภาษาไทย ให้ตอบเป็นภาษาไทยเท่านั้น ใช้ "ค่ะ/นะคะ"',
+            ? 'IMPORTANT: This conversation is in English. Reply in ENGLISH only. ' +
+              'Use the English order summary format. Do not write Thai sentences. ' +
+              'Thai product names may stay as they are.'
+            : 'สำคัญ: บทสนทนานี้เป็นภาษาไทย ให้ตอบเป็นภาษาไทยเท่านั้น ใช้ "ค่ะ/นะคะ"',
       },
     ];
 
@@ -155,7 +168,6 @@ export async function getAIReply(senderId: string, text: string): Promise<string
     return reply;
   } catch (err) {
     console.error('AI error:', err);
-    // Apologise in the customer's own language
     return lang === 'en' ? FALLBACK_EN : FALLBACK_TH;
   }
 }

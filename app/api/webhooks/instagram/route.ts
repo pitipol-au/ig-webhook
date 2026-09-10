@@ -1,6 +1,6 @@
 // app/api/webhooks/instagram/route.ts
 import { after } from 'next/server';
-import { getAIReply } from '../../../../lib/ai';
+import { getAIReply, detectLang } from '../../../../lib/ai';
 import { analyze } from '../../../../lib/extract';
 import { saveOrder } from '../../../../lib/orders';
 import { syncIfStale } from '../../../../lib/sync';
@@ -14,13 +14,13 @@ import {
   hasOrdered,
   markOrdered,
   clearOrdered,
+  getLang,
+  setLang,
 } from '../../../../lib/memory';
 
 // Meta resends the same message if we're slow or if we error.
 // Tracking message IDs prevents duplicate replies and duplicate orders.
 const handled = new Set<string>();
-
-const isThai = (s: string) => /[\u0e00-\u0e7f]/.test(s);
 
 /* ─────────────────────────────────────────────────────────────
    Webhook verification
@@ -54,7 +54,7 @@ export async function POST(req: Request) {
   }
 
   // Slow work runs AFTER the response. Meta waits ~5 seconds for a 200
-  // before assuming failure and resending.
+  // before assuming failure and resending the same message.
   after(async () => {
     syncIfStale().catch(() => {});
 
@@ -84,7 +84,9 @@ async function handleEvent(event: any) {
     console.log(`[SLIP URL] ${images[0].payload?.url}`);
     await sendMessage(
       senderId,
-      'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
+      getLang(senderId) === 'en'
+        ? 'Slip received 🙏 Our admin will verify and confirm shortly.'
+        : 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
     );
     return;
   }
@@ -120,9 +122,14 @@ async function handleEvent(event: any) {
 
   console.log(`Message from ${senderId}: ${text}`);
 
+  // Language is fixed on first contact. Per-message detection would
+  // flip a Thai customer to English the moment they type "ok".
+  setLang(senderId, detectLang(text));
+  const thai = (getLang(senderId) ?? 'th') === 'th';
+
   /* ── Human is driving this thread ─────────────────────────
-     Checked BEFORE analysis — no point spending an API call on
-     a conversation the bot isn't allowed to answer.
+     Checked BEFORE analysis — no point spending an API call on a
+     conversation the bot isn't allowed to answer.
      ─────────────────────────────────────────────────────── */
   if (isTakenOver(senderId)) {
     addTurn(senderId, 'user', text);
@@ -130,24 +137,22 @@ async function handleEvent(event: any) {
     return;
   }
 
-  /* ── One call: classify intent AND extract the order ──────
-     Replaces four keyword lists that could never be both loose
-     enough and tight enough at the same time.
-     ─────────────────────────────────────────────────────── */
+  /* ── One call: classify intent AND extract the order ─────── */
   const a = await analyze(senderId, text);
 
   if (!a) {
-    // Analysis failed. Fall back to chatting rather than going
-    // silent — a wrong answer beats no answer here.
+    // Analysis failed. Fall back to chatting rather than going silent —
+    // a plain answer beats no answer.
     console.error(`[ANALYSIS FAILED] ${senderId} — falling back to chat`);
     const reply = await getAIReply(senderId, text);
     await sendMessage(senderId, reply);
     return;
   }
 
-  console.log(`[INTENT] ${a.intent}  confirmed=${a.confirmed}  items=${a.items.length}`);
-
-  const thai = isThai(text);
+  console.log(
+    `[INTENT] ${a.intent}  confirmed=${a.confirmed}  items=${a.items.length}` +
+    (a.missing.length ? `  missing=${a.missing.join(',')}` : '')
+  );
 
   /* ── Explicit request for a person ───────────────────────── */
   if (a.intent === 'human_request') {

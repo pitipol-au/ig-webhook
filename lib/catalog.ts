@@ -1,10 +1,12 @@
 // lib/catalog.ts
 //
-// The product catalog is the shop's own Instagram posts, merged with
-// overrides from the Products sheet.
+// The catalog is the shop's Instagram posts, merged with overrides
+// from the Products sheet.
 //
 // Instagram gives the description. The sheet gives what Instagram
-// can't: stock status, a corrected price, and notes. Sheet wins.
+// can't and what captions state inconsistently: stock, a single
+// authoritative price, the real colour and size lists, and any
+// details the model would otherwise invent. Sheet wins.
 
 import { readTableCached } from './sheets';
 
@@ -18,8 +20,10 @@ export type Override = {
   title: string;
   price: string;
   inStock: boolean;
-  notes: string;
   colors: string;
+  sizes: string;
+  details: string;
+  notes: string;
 };
 
 let cache: Product[] = [];
@@ -29,9 +33,7 @@ const TTL_MS = 5 * 60 * 1000;
 /* ── Instagram posts ────────────────────────────────────────── */
 
 export async function getCatalog(): Promise<Product[]> {
-  if (cache.length > 0 && Date.now() - fetchedAt < TTL_MS) {
-    return cache;
-  }
+  if (cache.length > 0 && Date.now() - fetchedAt < TTL_MS) return cache;
 
   try {
     const token = process.env.IG_ACCESS_TOKEN;
@@ -68,14 +70,20 @@ export async function getOverrides(): Promise<Map<string, Override>> {
       if (!id) continue;
 
       map.set(id, {
-        title: r.title ?? '',
-        price: String(r.price ?? '').trim(),
-        // Sheets checkboxes come back as the strings "TRUE"/"FALSE".
+        title:   r.title ?? '',
+        price:   String(r.price ?? '').trim(),
+        // Sheets checkboxes come back as "TRUE"/"FALSE".
         // Default to in-stock so a blank cell doesn't hide a product.
         inStock: String(r.in_stock ?? '').toUpperCase() !== 'FALSE',
-        notes: r.notes ?? '',
-        colors: r.colors ?? '',
+        colors:  String(r.colors ?? '').trim(),
+        sizes:   String(r.sizes ?? '').trim(),
+        details: String(r.details ?? '').trim(),
+        notes:   r.notes ?? '',
       });
+    }
+
+    if (map.size === 0) {
+      console.warn('[CATALOG] No overrides loaded — check Sheets auth');
     }
   } catch (err) {
     console.error('Override read failed, using captions only:', err);
@@ -97,17 +105,24 @@ export function formatCatalog(
       const o = overrides?.get(p.id);
       const parts = [`[สินค้าที่ ${i + 1}]`, p.caption];
 
-      // Sheet price overrides whatever the caption says. Captions
-      // carry promo strikethroughs and inconsistent formats; the
-      // sheet is one authoritative number.
+      // Sheet price wins. Captions carry promo strikethroughs and
+      // inconsistent formats; the sheet is one authoritative number.
       if (o?.price) parts.push(`ราคาที่ถูกต้อง: ${o.price} บาท`);
 
-      // Stated bluntly so a small model can't miss it.
+      // Explicit allow-lists. The model invented "สีชมพูมิ้นท์" by
+      // blending colours from two different products, and accepted
+      // an order for size 2XL that doesn't exist.
+      if (o?.colors) parts.push(`สีที่มีจริงทั้งหมด (ห้ามเพิ่มสีอื่น): ${o.colors}`);
+      if (o?.sizes)  parts.push(`ไซส์ที่มีจริงทั้งหมด (ห้ามรับไซส์อื่น): ${o.sizes}`);
+
+      // Anywhere this is blank, the model must say "ไม่ได้ระบุ"
+      // rather than filling the gap — it invented care instructions
+      // and fibre composition when left with nothing.
+      if (o?.details) parts.push(`รายละเอียดเพิ่มเติม: ${o.details}`);
+
       if (o && !o.inStock) {
         parts.push('⚠️ สถานะ: สินค้าหมด — ห้ามรับออเดอร์สินค้านี้เด็ดขาด');
       }
-
-      if (o?.colors) parts.push(`สีที่มีจริง (ห้ามเพิ่มสีอื่น): ${o.colors}`);
 
       if (o?.notes) parts.push(`หมายเหตุ: ${o.notes}`);
       parts.push(`ลิงก์: ${p.permalink}`);
