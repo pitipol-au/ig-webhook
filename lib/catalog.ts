@@ -19,6 +19,7 @@ export type Override = {
   price: string;
   inStock: boolean;
   notes: string;
+  colors: string;
 };
 
 let cache: Product[] = [];
@@ -73,6 +74,7 @@ export async function getOverrides(): Promise<Map<string, Override>> {
         // Default to in-stock so a blank cell doesn't hide a product.
         inStock: String(r.in_stock ?? '').toUpperCase() !== 'FALSE',
         notes: r.notes ?? '',
+        colors: r.colors ?? '',
       });
     }
   } catch (err) {
@@ -104,6 +106,8 @@ export function formatCatalog(
       if (o && !o.inStock) {
         parts.push('⚠️ สถานะ: สินค้าหมด — ห้ามรับออเดอร์สินค้านี้เด็ดขาด');
       }
+
+      if (o?.colors) parts.push(`สีที่มีจริง (ห้ามเพิ่มสีอื่น): ${o.colors}`);
 
       if (o?.notes) parts.push(`หมายเหตุ: ${o.notes}`);
       parts.push(`ลิงก์: ${p.permalink}`);
