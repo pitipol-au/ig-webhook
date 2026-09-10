@@ -4,11 +4,11 @@
 // admin dashboard — the shop owner sets status by hand.
 
 import { appendRow } from './sheets';
-import type { ExtractedOrder } from './extract';
+import type { Analysis } from './extract';
 
 export async function saveOrder(
   customerId: string,
-  order: ExtractedOrder
+  order: Analysis
 ): Promise<string> {
   const orderNo = `ORD-${Date.now().toString(36).toUpperCase()}`;
 

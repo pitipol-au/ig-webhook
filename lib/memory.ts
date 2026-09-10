@@ -1,6 +1,6 @@
 // lib/memory.ts
 //
-// Conversation history and handover state, held in memory.
+// Conversation history and per-thread state, held in memory.
 // Cleared on every restart — including customers mid-order.
 // This is the largest known limitation of the current build.
 
@@ -9,22 +9,9 @@ type Turn = { role: 'user' | 'model'; text: string };
 const conversations = new Map<string, Turn[]>();
 const takenOver = new Set<string>();
 const botSent = new Set<string>();
-
-const MAX_TURNS = 20;
-
 const ordered = new Set<string>();
 
-export function hasOrdered(senderId: string): boolean {
-  return ordered.has(senderId);
-}
-
-export function markOrdered(senderId: string) {
-  ordered.add(senderId);
-}
-
-export function clearOrdered(senderId: string) {
-  ordered.delete(senderId);
-}
+const MAX_TURNS = 20;
 
 /* ── Conversation history ───────────────────────────────────── */
 
@@ -51,6 +38,23 @@ export function takeOver(senderId: string) {
 
 export function releaseToBot(senderId: string) {
   takenOver.delete(senderId);
+}
+
+/* ── Duplicate order guard ──────────────────────────────────
+   Without this, a customer agreeing twice produces two order
+   rows — and gets charged and shipped twice.
+   ───────────────────────────────────────────────────────────── */
+
+export function hasOrdered(senderId: string): boolean {
+  return ordered.has(senderId);
+}
+
+export function markOrdered(senderId: string) {
+  ordered.add(senderId);
+}
+
+export function clearOrdered(senderId: string) {
+  ordered.delete(senderId);
 }
 
 /* ── Recognising our own echoes ─────────────────────────────
