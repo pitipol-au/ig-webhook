@@ -93,3 +93,26 @@ export function markBotSent(text: string) {
 export function wasBotSent(text: string): boolean {
   return botSent.has(text);
 }
+
+const lastImageAt = new Map<string, number>();
+
+export function markImageHandled(senderId: string) {
+  lastImageAt.set(senderId, Date.now());
+}
+
+export function recentlyHandledImage(senderId: string, withinMs = 10_000): boolean {
+  const t = lastImageAt.get(senderId);
+  return t !== undefined && Date.now() - t < withinMs;
+}
+
+const pendingText = new Map<string, string>();
+
+export function setPendingText(senderId: string, text: string) {
+  pendingText.set(senderId, text);
+}
+
+export function takePendingText(senderId: string): string | null {
+  const t = pendingText.get(senderId) ?? null;
+  pendingText.delete(senderId);
+  return t;
+}

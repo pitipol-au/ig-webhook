@@ -23,6 +23,22 @@ import {
 // Tracking message IDs prevents duplicate replies and duplicate orders.
 const handled = new Set<string>();
 
+/* ── Image / caption coordination ───────────────────────────────
+   Instagram delivers a photo and its caption as SEPARATE webhook
+   deliveries, not one batch. Without coordination the customer gets
+   two replies: one for the picture, one for the words.
+
+   The image handler waits briefly for a caption; the text handler
+   hands its message over and stays quiet if an image is mid-flight.
+
+   NOTE: this state is in process memory. On Vercel, separate
+   invocations may land on different instances, so this is
+   best-effort until conversation state moves to a real store.
+   ───────────────────────────────────────────────────────────── */
+const imageInFlight = new Map<string, number>();
+const pendingCaption = new Map<string, string>();
+const CAPTION_WAIT_MS = 2000;
+
 /* ─────────────────────────────────────────────────────────────
    Webhook verification
    ───────────────────────────────────────────────────────────── */
@@ -62,9 +78,8 @@ export async function POST(req: Request) {
     for (const entry of body.entry ?? []) {
       const events = entry.messaging ?? [];
 
-      // A photo sent WITH a caption arrives as two separate events.
-      // Without this the customer gets two replies saying the same
-      // thing — one for the image, one for the text.
+      // Same-batch case: a photo and caption occasionally do arrive
+      // together. Cheap to check, and saves the 2s wait.
       const batchHasText = events.some(
         (e: any) => e.message?.text && !e.message?.is_echo
       );
@@ -97,49 +112,71 @@ async function handleEvent(event: any, batchHasText = false) {
     const url = images[0].payload?.url;
     const thai = (getLang(senderId) ?? 'th') === 'th';
 
-    const { kind, description } = await analyzeImage(url);
-    console.log(`[IMAGE] ${senderId} — ${kind}${description ? `: ${description.slice(0, 80)}` : ''}`);
+    imageInFlight.set(senderId, Date.now());
 
-    if (kind === 'slip') {
-      takeOver(senderId);
-      console.log(`[SLIP URL] ${url}`);
-      await sendMessage(
-        senderId,
-        thai
-          ? 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
-          : 'Slip received 🙏 Our admin will verify and confirm shortly.'
+    try {
+      // Classify first — a slip must never wait, and must never be
+      // confused with a product enquiry.
+      const { kind, description } = await analyzeImage(url);
+      console.log(
+        `[IMAGE] ${senderId} — ${kind}` +
+        (description ? `: ${description.slice(0, 80)}` : '')
       );
-      return;
-    }
 
-    if (kind === 'product' && description) {
-      // Match the photo against the catalog. The vision model
-      // describes; the chat model matches against real products,
-      // so a weak description can't invent stock we don't have.
-      try {
-        const suggestion = await findSimilar(description, thai);
-        if (suggestion) {
-          addTurn(senderId, 'user', thai
-            ? `[ลูกค้าส่งรูปสินค้า: ${description}]`
-            : `[Customer sent a product photo: ${description}]`);
-          addTurn(senderId, 'model', suggestion);
-          await sendMessage(senderId, suggestion);
-          return;
-        }
-      } catch (err) {
-        console.error('Similar-item match failed:', err);
+      if (kind === 'slip') {
+        takeOver(senderId);
+        console.log(`[SLIP URL] ${url}`);
+        await sendMessage(
+          senderId,
+          thai
+            ? 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
+            : 'Slip received 🙏 Our admin will verify and confirm shortly.'
+        );
+        return;
       }
-    }
 
-    // Unrecognised image, or matching failed. Stay quiet if the
-    // customer also sent text — their message will get a reply.
-    if (!batchHasText) {
+      // Give a caption time to arrive as its own webhook delivery.
+      // Two seconds is invisible to a customer and removes the
+      // duplicate reply.
+      if (!batchHasText) {
+        await new Promise(r => setTimeout(r, CAPTION_WAIT_MS));
+      }
+      const caption = pendingCaption.get(senderId) ?? '';
+      pendingCaption.delete(senderId);
+
+      if (kind === 'product' && description) {
+        // The vision model describes; the chat model matches against
+        // the real catalog. Splitting them means a weak description
+        // can't invent stock we don't have.
+        try {
+          const suggestion = await findSimilar(
+            caption ? `${description}\n\nCustomer also said: ${caption}` : description,
+            thai
+          );
+          if (suggestion) {
+            addTurn(
+              senderId,
+              'user',
+              `[photo: ${description}]${caption ? ` ${caption}` : ''}`
+            );
+            addTurn(senderId, 'model', suggestion);
+            await sendMessage(senderId, suggestion);
+            return;
+          }
+        } catch (err) {
+          console.error('Similar-item match failed:', err);
+        }
+      }
+
+      // Unrecognised image, or matching failed.
       await sendMessage(
         senderId,
         thai
           ? 'ได้รับรูปแล้วค่ะ 🙏 รบกวนบอกชื่อสินค้าที่สนใจได้ไหมคะ'
           : 'Thanks for the photo 🙏 Could you tell me which item you are looking for?'
       );
+    } finally {
+      imageInFlight.delete(senderId);
     }
     return;
   }
@@ -179,6 +216,18 @@ async function handleEvent(event: any, batchHasText = false) {
   // flip a Thai customer to English the moment they type "ok".
   setLang(senderId, detectLang(text));
   const thai = (getLang(senderId) ?? 'th') === 'th';
+
+  /* ── Caption for an image we're already answering ─────────
+     Hand the text to the image handler and stay silent, so the
+     customer gets one reply instead of two.
+     ─────────────────────────────────────────────────────── */
+  const inFlight = imageInFlight.get(senderId);
+  if (inFlight !== undefined && Date.now() - inFlight < CAPTION_WAIT_MS + 1000) {
+    pendingCaption.set(senderId, text);
+    addTurn(senderId, 'user', text);
+    console.log(`[CAPTION] ${senderId} — folded into the image reply`);
+    return;
+  }
 
   /* ── Human is driving this thread ─────────────────────────
      Checked BEFORE analysis — no point spending an API call on a
