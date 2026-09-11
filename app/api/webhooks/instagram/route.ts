@@ -17,6 +17,7 @@ import {
   getLang,
   setLang,
 } from '../../../../lib/memory';
+import { classifyImage } from '../../../../lib/image';
 
 // Meta resends the same message if we're slow or if we error.
 // Tracking message IDs prevents duplicate replies and duplicate orders.
@@ -74,20 +75,33 @@ export async function POST(req: Request) {
 
 async function handleEvent(event: any) {
   /* ── Images (bank slips) ─────────────────────────────────── */
-  const images = (event.message?.attachments ?? []).filter(
+    const images = (event.message?.attachments ?? []).filter(
     (a: any) => a.type === 'image'
   );
   if (images.length > 0 && !event.message?.is_echo) {
     const senderId = event.sender.id;
-    takeOver(senderId);
-    console.log(`[HANDOVER] ${senderId} — ${images.length} image(s)`);
-    console.log(`[SLIP URL] ${images[0].payload?.url}`);
-    await sendMessage(
-      senderId,
-      getLang(senderId) === 'en'
-        ? 'Slip received 🙏 Our admin will verify and confirm shortly.'
-        : 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
-    );
+    const url = images[0].payload?.url;
+    const kind = await classifyImage(url);
+    console.log(`[IMAGE] ${senderId} — classified as ${kind}`);
+
+    if (kind === 'slip') {
+      takeOver(senderId);
+      console.log(`[SLIP URL] ${url}`);
+      await sendMessage(
+        senderId,
+        getLang(senderId) === 'en'
+          ? 'Slip received 🙏 Our admin will verify and confirm shortly.'
+          : 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
+      );
+    } else {
+      // Product photo — keep the conversation going.
+      await sendMessage(
+        senderId,
+        getLang(senderId) === 'en'
+          ? 'Thanks for the photo 🙏 Could you tell me which item you are looking for?'
+          : 'ได้รับรูปแล้วค่ะ 🙏 รบกวนบอกชื่อสินค้าที่สนใจได้ไหมคะ'
+      );
+    }
     return;
   }
 
