@@ -1,15 +1,21 @@
 // lib/extract.ts
 //
-// One call that classifies intent AND extracts the order.
+// One call that classifies the message AND extracts the order.
 //
-// This replaced keyword trigger lists, which could never be both
-// loose enough to catch real intent and tight enough to avoid false
-// matches, in two languages. Every attempt proved it:
+// Replaced keyword trigger lists, which could never be both loose
+// enough to catch real intent and tight enough to avoid false matches,
+// in two languages. Every attempt proved it:
 //
 //   สี      matched inside unrelated Thai words
 //   ครับ    matched inside สวัสดีครับ
 //   account matched "what's this account for?"
 //   ok      matched inside "book"
+//
+// The tier system comes from a colleague's prompt design, with one
+// change: tiers are returned as STRUCTURED DATA, never appended to
+// the reply text. The original design had the model write
+// "[SYSTEM NOTE: Tier 3 triggered]" into its answer — which would
+// send internal telemetry straight to the customer.
 
 import { getHistory } from './memory';
 import { getFormattedCatalog } from './catalog';
@@ -23,7 +29,16 @@ export type Intent =
   | 'confirm_order'   // agreeing to a summarised order
   | 'payment'         // asking how to pay, or claiming to have paid
   | 'human_request'   // explicitly wants a person
+  | 'complaint'       // frustrated, unhappy, cancelling
+  | 'uncovered'       // customisation or logistics not in the catalog
   | 'other';
+
+/**
+ * 1 = bot handles it
+ * 2 = bot keeps helping, seller gets notified (soft handoff)
+ * 3 = bot stops, human takes over (hard cutoff)
+ */
+export type Tier = 1 | 2 | 3;
 
 export type OrderItem = {
   title: string;
@@ -35,6 +50,8 @@ export type OrderItem = {
 
 export type Analysis = {
   intent: Intent;
+  tier: Tier;
+  tierReason: string;
   confirmed: boolean;
   items: OrderItem[];
   subtotal: number;
@@ -43,52 +60,79 @@ export type Analysis = {
   missing: string[];
 };
 
-const PROMPT = `คุณคือระบบวิเคราะห์บทสนทนาการขาย ไม่ใช่แชทบอท
-อ่านบทสนทนาแล้วตอบเป็น JSON เท่านั้น ห้ามมีข้อความอื่น
+const PROMPT = `You analyse sales conversations. You are not a chatbot.
+Read the conversation and reply with JSON only. No other text.
 
---- การจำแนก intent (ดูจากข้อความล่าสุดของลูกค้า) ---
+=== INTENT (judge the customer's LATEST message) ===
 
-"question"      = ถามข้อมูลสินค้า ราคา สต็อก ค่าส่ง หรือเรื่องทั่วไป
-                  รวมถึงถามว่าบัญชีนี้คือร้านอะไร ขายอะไร
-"confirm_order" = ตอบตกลงกับรายการที่ร้านสรุปไปแล้ว
-                  ต้องมีการสรุปรายการก่อนเท่านั้น
-"payment"       = ถามวิธีชำระเงิน ขอเลขบัญชี ขอ QR หรือแจ้งว่าโอนแล้ว
-"human_request" = ขอคุยกับคน ขอแอดมิน
-"other"         = ทักทาย คุยเล่น หรืออื่นๆ
+"question"      = asking about products, prices, stock, shipping, or
+                  general shop questions, including "what is this
+                  account for"
+"confirm_order" = agreeing to an order the shop has already summarised.
+                  Requires a prior summary.
+"payment"       = asking how to pay, requesting an account number or QR,
+                  or saying they have transferred
+"human_request" = explicitly asking to speak to a person
+"complaint"     = frustrated, dissatisfied, complaining about service,
+                  or cancelling
+"uncovered"     = asking for customisation, or a shipping/logistics
+                  detail the product information does not cover,
+                  asked in a neutral tone
+"other"         = greetings, small talk, anything else
 
-สำคัญมาก:
-- "ครับ" "ค่ะ" เป็นคำลงท้ายสุภาพ ไม่ใช่การยืนยัน
-  "สวัสดีครับ" = other, ไม่ใช่ confirm_order
-- คำว่า "บัญชี" "account" อาจหมายถึงบัญชี Instagram ไม่ใช่บัญชีธนาคาร
-  "What's this account for?" = question, ไม่ใช่ payment
-- ดูความหมายของทั้งประโยค ห้ามดูแค่คำเดี่ยวๆ
-- บทสนทนาอาจเป็นภาษาไทยหรืออังกฤษ
+CRITICAL:
+- "ครับ" and "ค่ะ" are politeness particles, NOT confirmations.
+  "สวัสดีครับ" is "other", not "confirm_order".
+- "บัญชี" / "account" may mean an Instagram account, not a bank account.
+  "What's this account for?" is "question", not "payment".
+- Judge the meaning of the whole sentence. Never match on single words.
+- Judge complaints by TONE and MEANING, not by keyword.
+  "พอแล้วค่ะ ขอบคุณ" is a polite ending, not a complaint.
+  "พอแล้ว! ตอบช้ามาก" is a complaint.
+- The conversation may be in Thai or English.
 
---- การดึงข้อมูลคำสั่งซื้อ ---
+=== TIER ===
 
-- confirmed = true เฉพาะเมื่อ intent = "confirm_order" หรือ "payment"
-  และร้านสรุปรายการไปแล้ว และลูกค้าตกลง
-- ถ้าร้านยังไม่ได้สรุปรายการ ให้ confirmed = false เสมอ
-- ใช้ราคาจากข้อมูลสินค้าเท่านั้น ถ้ามี "ราคาที่ถูกต้อง" ให้ใช้ตัวเลขนั้น
-- ห้ามคิดราคาเอง ถ้าไม่รู้ราคาให้ใส่ 0
-- title ให้ใช้ชื่อสินค้าภาษาไทยเสมอ แม้บทสนทนาเป็นภาษาอังกฤษ
+tier 1 = intent is question, confirm_order, or other.
+         The bot handles it.
+tier 2 = intent is uncovered.
+         The bot keeps helping with what it knows; the seller is
+         notified in the background.
+tier 3 = intent is payment, human_request, or complaint.
+         The bot stops and a human takes over.
 
-การตรวจสอบก่อนยืนยัน (สำคัญ):
-- size ต้องตรงกับ "ไซส์ที่มีจริงทั้งหมด" ของสินค้านั้น
-  ถ้าไม่ตรง ให้ confirmed = false และใส่ "ไซส์ไม่ถูกต้อง" ใน missing
-- color ต้องตรงกับ "สีที่มีจริงทั้งหมด" ของสินค้านั้น
-  ถ้าไม่ตรง ให้ confirmed = false และใส่ "สีไม่ถูกต้อง" ใน missing
-- ถ้าสินค้ามีสถานะ "สินค้าหมด" ให้ confirmed = false
-  และใส่ "สินค้าหมด" ใน missing
+tierReason = a short phrase in English explaining the trigger,
+             e.g. "asked for bank account", "frustrated tone",
+             "custom embroidery request"
 
-การนับจำนวน (สำคัญ):
-- qty ต้องมาจากคำที่ลูกค้าระบุจำนวนชัดเจนเท่านั้น
-- ห้ามเอาตัวเลขจากชื่อไซส์มาเป็นจำนวน
-  เช่น "2XL Grey" คือไซส์ 2XL ไม่ใช่จำนวน 2
-- ถ้าลูกค้าไม่ได้ระบุจำนวน ให้ใส่ "จำนวน" ใน missing และ confirmed = false
+=== ORDER EXTRACTION ===
 
-รูปแบบ:
-{"intent":"question","confirmed":false,"items":[],"subtotal":0,"shipping":${SHIPPING_THB},"total":0,"missing":[]}`;
+- confirmed = true only when intent is "confirm_order" or "payment",
+  AND the shop has already summarised the order, AND the customer
+  agreed.
+- If the shop has not summarised yet, confirmed = false always.
+- Use prices from the product information only. If a product shows
+  "ราคาที่ถูกต้อง", use that number.
+- Never calculate a price yourself. If unknown, use 0.
+- title must be the Thai product name, even in an English conversation.
+
+VALIDATION BEFORE CONFIRMING:
+- size must match that product's "ไซส์ที่มีจริงทั้งหมด".
+  If not, confirmed = false and add "ไซส์ไม่ถูกต้อง" to missing.
+- color must match that product's "สีที่มีจริงทั้งหมด".
+  If not, confirmed = false and add "สีไม่ถูกต้อง" to missing.
+- If the product is marked "สินค้าหมด", confirmed = false and add
+  "สินค้าหมด" to missing.
+
+QUANTITY:
+- qty comes only from an explicit quantity the customer stated.
+- Never take a number from a size name. "2XL Grey" is size 2XL,
+  not quantity 2.
+- If no quantity was stated, add "จำนวน" to missing and
+  confirmed = false.
+
+=== FORMAT ===
+{"intent":"question","tier":1,"tierReason":"","confirmed":false,"items":[],"subtotal":0,"shipping":${SHIPPING_THB},"total":0,"missing":[]}`;
 
 export async function analyze(
   senderId: string,
@@ -98,8 +142,8 @@ export async function analyze(
   const catalogText = await getFormattedCatalog();
 
   const transcript = [
-    ...history.map(t => `${t.role === 'user' ? 'ลูกค้า' : 'ร้าน'}: ${t.text}`),
-    `ลูกค้า (ข้อความล่าสุด): ${latestText}`,
+    ...history.map(t => `${t.role === 'user' ? 'Customer' : 'Shop'}: ${t.text}`),
+    `Customer (latest message): ${latestText}`,
   ].join('\n');
 
   try {
@@ -112,7 +156,7 @@ export async function analyze(
       body: JSON.stringify({
         model: MODEL,
         messages: [
-          { role: 'system', content: `${PROMPT}\n\nสินค้า:\n${catalogText}` },
+          { role: 'system', content: `${PROMPT}\n\nPRODUCTS:\n${catalogText}` },
           { role: 'user', content: transcript },
         ],
         response_format: { type: 'json_object' },
@@ -147,17 +191,31 @@ function recompute(raw: any): Analysis {
     0
   );
 
-  const valid: Intent[] = [
-    'question', 'confirm_order', 'payment', 'human_request', 'other',
+  const validIntents: Intent[] = [
+    'question', 'confirm_order', 'payment',
+    'human_request', 'complaint', 'uncovered', 'other',
   ];
-  const intent: Intent = valid.includes(raw.intent) ? raw.intent : 'question';
+  const intent: Intent = validIntents.includes(raw.intent)
+    ? raw.intent
+    : 'question';   // safest default — keeps the bot talking
 
-  // Belt and braces: an item priced at 0 means the model couldn't find
-  // a price. Writing that to the sheet would create a free order.
+  // Derive the tier from intent rather than trusting the model's own
+  // tier field. Intent is a simpler judgement and less likely to drift.
+  const tier: Tier =
+    intent === 'payment' || intent === 'human_request' || intent === 'complaint'
+      ? 3
+      : intent === 'uncovered'
+      ? 2
+      : 1;
+
+  // An item priced at 0 means no price was found. Writing that to the
+  // sheet would create a free order.
   const priced = items.every(i => Number(i.price) > 0);
 
   return {
     intent,
+    tier,
+    tierReason: String(raw.tierReason ?? '').slice(0, 120),
     confirmed: Boolean(raw.confirmed) && priced && items.length > 0,
     items,
     subtotal,

@@ -150,25 +150,17 @@ async function handleEvent(event: any) {
   }
 
   console.log(
-    `[INTENT] ${a.intent}  confirmed=${a.confirmed}  items=${a.items.length}` +
+    `[TIER ${a.tier}] intent=${a.intent}` +
+    (a.tierReason ? ` (${a.tierReason})` : '') +
+    `  confirmed=${a.confirmed}  items=${a.items.length}` +
     (a.missing.length ? `  missing=${a.missing.join(',')}` : '')
   );
 
-  /* ── Explicit request for a person ───────────────────────── */
-  if (a.intent === 'human_request') {
-    takeOver(senderId);
-    addTurn(senderId, 'user', text);
-    console.log(`[HANDOVER] ${senderId} — asked for a human`);
-    await sendMessage(
-      senderId,
-      thai
-        ? 'สักครู่นะคะ เดี๋ยวแอดมินมาตอบเองค่ะ 🙏'
-        : 'One moment please — our admin will reply to you shortly 🙏'
-    );
-    return;
-  }
-
   /* ── Order confirmed, or payment raised with an order ready ─
+     Checked before the tier cutoff: a customer saying "โอนยังไง"
+     with a confirmed order should get their order number, not a
+     bare handover message.
+
      Order number and total come from CODE, never the model.
      hasOrdered() stops a second row on the same thread — a
      customer agreeing twice must not be charged twice.
@@ -190,22 +182,48 @@ async function handleEvent(event: any) {
     return;
   }
 
-  /* ── Payment topic, but no order to write ─────────────────
+  /* ── TIER 3 — hard cutoff ─────────────────────────────────
+     Payment, an explicit request for a person, or a complaint.
+     Acknowledge briefly and stop. Do NOT keep selling or
+     reassuring — that is what annoys an already-unhappy customer.
+
      The bot must never hand out an account number: it cannot
      verify a transfer, and a wrong PromptPay ID sends a
      customer's money to a stranger.
      ─────────────────────────────────────────────────────── */
-  if (a.intent === 'payment') {
+  if (a.tier === 3) {
     takeOver(senderId);
     addTurn(senderId, 'user', text);
-    console.log(`[HANDOVER] ${senderId} — payment topic, no confirmed order`);
-    await sendMessage(
-      senderId,
-      thai
+    console.warn(`[TIER 3] ${senderId} — ${a.intent}: ${a.tierReason}`);
+
+    let msg: string;
+    if (a.intent === 'complaint') {
+      msg = thai
+        ? 'ขอบคุณที่แจ้งนะคะ ทางร้านขอเช็คให้เดี๋ยวนี้เลยค่ะ 🙏'
+        : 'Thank you for letting us know — we are looking into this right away 🙏';
+    } else if (a.intent === 'human_request') {
+      msg = thai
+        ? 'สักครู่นะคะ เดี๋ยวแอดมินมาตอบเองค่ะ 🙏'
+        : 'One moment please — our admin will reply to you shortly 🙏';
+    } else {
+      msg = thai
         ? 'รับทราบค่ะ 🙏 เดี๋ยวแอดมินมาสรุปยอดและแจ้งช่องทางชำระเงินให้นะคะ'
-        : 'Noted 🙏 Our admin will confirm your order and send payment details shortly.'
-    );
+        : 'Noted 🙏 Our admin will confirm your order and send payment details shortly.';
+    }
+
+    await sendMessage(senderId, msg);
     return;
+  }
+
+  /* ── TIER 2 — soft handoff ────────────────────────────────
+     Customisation or logistics the catalog doesn't cover. Keep
+     helping with what we do know, but flag it so the seller can
+     step in. The customer sees a normal reply — the flag is
+     internal only.
+     ─────────────────────────────────────────────────────── */
+  if (a.tier === 2) {
+    console.warn(`[TIER 2] ${senderId} — seller should follow up: ${a.tierReason}`);
+    // Not takeOver(): the bot stays available for other questions.
   }
 
   /* ── Everything else: normal conversation ────────────────── */
