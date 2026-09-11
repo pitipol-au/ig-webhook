@@ -2,6 +2,7 @@
 import { after } from 'next/server';
 import { getAIReply, detectLang } from '../../../../lib/ai';
 import { analyze } from '../../../../lib/extract';
+import { analyzeImage, findSimilar } from '../../../../lib/image';
 import { saveOrder } from '../../../../lib/orders';
 import { syncIfStale } from '../../../../lib/sync';
 import {
@@ -17,7 +18,6 @@ import {
   getLang,
   setLang,
 } from '../../../../lib/memory';
-import { classifyImage } from '../../../../lib/image';
 
 // Meta resends the same message if we're slow or if we error.
 // Tracking message IDs prevents duplicate replies and duplicate orders.
@@ -60,9 +60,18 @@ export async function POST(req: Request) {
     syncIfStale().catch(() => {});
 
     for (const entry of body.entry ?? []) {
-      for (const event of entry.messaging ?? []) {
+      const events = entry.messaging ?? [];
+
+      // A photo sent WITH a caption arrives as two separate events.
+      // Without this the customer gets two replies saying the same
+      // thing — one for the image, one for the text.
+      const batchHasText = events.some(
+        (e: any) => e.message?.text && !e.message?.is_echo
+      );
+
+      for (const event of events) {
         try {
-          await handleEvent(event);
+          await handleEvent(event, batchHasText);
         } catch (err) {
           console.error('Event failed:', err);
         }
@@ -73,33 +82,63 @@ export async function POST(req: Request) {
   return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
-async function handleEvent(event: any) {
-  /* ── Images (bank slips) ─────────────────────────────────── */
-    const images = (event.message?.attachments ?? []).filter(
+async function handleEvent(event: any, batchHasText = false) {
+  /* ── Images ──────────────────────────────────────────────
+     Not every image is a payment slip. A customer sending a
+     product photo to ask "do you have this?" must not be told
+     their slip is being verified.
+     ─────────────────────────────────────────────────────── */
+  const images = (event.message?.attachments ?? []).filter(
     (a: any) => a.type === 'image'
   );
+
   if (images.length > 0 && !event.message?.is_echo) {
     const senderId = event.sender.id;
     const url = images[0].payload?.url;
-    const kind = await classifyImage(url);
-    console.log(`[IMAGE] ${senderId} — classified as ${kind}`);
+    const thai = (getLang(senderId) ?? 'th') === 'th';
+
+    const { kind, description } = await analyzeImage(url);
+    console.log(`[IMAGE] ${senderId} — ${kind}${description ? `: ${description.slice(0, 80)}` : ''}`);
 
     if (kind === 'slip') {
       takeOver(senderId);
       console.log(`[SLIP URL] ${url}`);
       await sendMessage(
         senderId,
-        getLang(senderId) === 'en'
-          ? 'Slip received 🙏 Our admin will verify and confirm shortly.'
-          : 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
+        thai
+          ? 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
+          : 'Slip received 🙏 Our admin will verify and confirm shortly.'
       );
-    } else {
-      // Product photo — keep the conversation going.
+      return;
+    }
+
+    if (kind === 'product' && description) {
+      // Match the photo against the catalog. The vision model
+      // describes; the chat model matches against real products,
+      // so a weak description can't invent stock we don't have.
+      try {
+        const suggestion = await findSimilar(description, thai);
+        if (suggestion) {
+          addTurn(senderId, 'user', thai
+            ? `[ลูกค้าส่งรูปสินค้า: ${description}]`
+            : `[Customer sent a product photo: ${description}]`);
+          addTurn(senderId, 'model', suggestion);
+          await sendMessage(senderId, suggestion);
+          return;
+        }
+      } catch (err) {
+        console.error('Similar-item match failed:', err);
+      }
+    }
+
+    // Unrecognised image, or matching failed. Stay quiet if the
+    // customer also sent text — their message will get a reply.
+    if (!batchHasText) {
       await sendMessage(
         senderId,
-        getLang(senderId) === 'en'
-          ? 'Thanks for the photo 🙏 Could you tell me which item you are looking for?'
-          : 'ได้รับรูปแล้วค่ะ 🙏 รบกวนบอกชื่อสินค้าที่สนใจได้ไหมคะ'
+        thai
+          ? 'ได้รับรูปแล้วค่ะ 🙏 รบกวนบอกชื่อสินค้าที่สนใจได้ไหมคะ'
+          : 'Thanks for the photo 🙏 Could you tell me which item you are looking for?'
       );
     }
     return;
@@ -172,7 +211,7 @@ async function handleEvent(event: any) {
 
   /* ── Order confirmed, or payment raised with an order ready ─
      Checked before the tier cutoff: a customer saying "โอนยังไง"
-     with a confirmed order should get their order number, not a
+     with a complete order should get their order number, not a
      bare handover message.
 
      Order number and total come from CODE, never the model.

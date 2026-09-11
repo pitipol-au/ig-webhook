@@ -1,30 +1,95 @@
-// lib/orders.ts
+// lib/memory.ts
 //
-// Writes confirmed orders to the Orders tab. That sheet is the
-// admin dashboard — the shop owner sets status by hand.
+// Conversation history and per-thread state, held in memory.
+// Cleared on every restart — including customers mid-order.
+// This is the largest known limitation of the current build.
 
-import { appendRow } from './sheets';
-import type { Analysis } from './extract';
+type Turn = { role: 'user' | 'model'; text: string };
 
-export async function saveOrder(
-  customerId: string,
-  order: Analysis
-): Promise<string> {
-  const orderNo = `ORD-${Date.now().toString(36).toUpperCase()}`;
+const conversations = new Map<string, Turn[]>();
+const takenOver = new Set<string>();
+const botSent = new Set<string>();
+const ordered = new Set<string>();
+const langs = new Map<string, 'th' | 'en'>();
 
-  const items = order.items
-    .map(i => `${i.title} ${i.color} ${i.size} x${i.qty}`.replace(/\s+/g, ' ').trim())
-    .join(' | ');
+const MAX_TURNS = 20;
 
-  await appendRow('Orders', [
-    new Date().toISOString(),
-    customerId,
-    items,
-    order.total,
-    'pending_payment',
-    '',            // slip_url — filled in later
-    orderNo,
-  ]);
+/* ── Conversation history ───────────────────────────────────── */
 
-  return orderNo;
+export function getHistory(senderId: string): Turn[] {
+  return conversations.get(senderId) ?? [];
+}
+
+export function addTurn(senderId: string, role: 'user' | 'model', text: string) {
+  const history = conversations.get(senderId) ?? [];
+  history.push({ role, text });
+  if (history.length > MAX_TURNS) history.shift();
+  conversations.set(senderId, history);
+}
+
+/* ── Conversation language ──────────────────────────────────
+   Set once, on first contact, then fixed for the thread.
+   Per-message detection is fragile: a Thai customer typing "ok"
+   has no Thai characters and would flip the whole reply to
+   English mid-order.
+   ───────────────────────────────────────────────────────────── */
+
+export function getLang(senderId: string): 'th' | 'en' | null {
+  return langs.get(senderId) ?? null;
+}
+
+export function setLang(senderId: string, lang: 'th' | 'en') {
+  if (!langs.has(senderId)) langs.set(senderId, lang);   // first contact wins
+}
+
+export function clearLang(senderId: string) {
+  langs.delete(senderId);
+}
+
+/* ── Human handover ─────────────────────────────────────────── */
+
+export function isTakenOver(senderId: string): boolean {
+  return takenOver.has(senderId);
+}
+
+export function takeOver(senderId: string) {
+  takenOver.add(senderId);
+}
+
+export function releaseToBot(senderId: string) {
+  takenOver.delete(senderId);
+}
+
+/* ── Duplicate order guard ──────────────────────────────────
+   Without this, a customer agreeing twice produces two order
+   rows — and gets charged and shipped twice.
+   ───────────────────────────────────────────────────────────── */
+
+export function hasOrdered(senderId: string): boolean {
+  return ordered.has(senderId);
+}
+
+export function markOrdered(senderId: string) {
+  ordered.add(senderId);
+}
+
+export function clearOrdered(senderId: string) {
+  ordered.delete(senderId);
+}
+
+/* ── Recognising our own echoes ─────────────────────────────
+   Instagram echoes every outbound message back to the webhook,
+   including ones the bot sent. Without this the bot sees its own
+   reply, assumes a human typed it, and silences itself.
+   ───────────────────────────────────────────────────────────── */
+
+export function markBotSent(text: string) {
+  botSent.add(text);
+  if (botSent.size > 200) {
+    botSent.delete(botSent.values().next().value!);
+  }
+}
+
+export function wasBotSent(text: string): boolean {
+  return botSent.has(text);
 }
