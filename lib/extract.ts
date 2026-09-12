@@ -138,7 +138,7 @@ export async function analyze(
   senderId: string,
   latestText: string
 ): Promise<Analysis | null> {
-  const history = getHistory(senderId);
+  const history = await getHistory(senderId);
   const catalogText = await getFormattedCatalog();
 
   const transcript = [

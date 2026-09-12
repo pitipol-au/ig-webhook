@@ -17,27 +17,16 @@ import {
   clearOrdered,
   getLang,
   setLang,
+  claimMessage,
+  markImageInFlight,
+  isImageInFlight,
+  clearImageInFlight,
+  setPendingCaption,
+  takePendingCaption,
 } from '../../../../lib/memory';
 
-// Meta resends the same message if we're slow or if we error.
-// Tracking message IDs prevents duplicate replies and duplicate orders.
-const handled = new Set<string>();
-
-/* ── Image / caption coordination ───────────────────────────────
-   Instagram delivers a photo and its caption as SEPARATE webhook
-   deliveries, not one batch. Without coordination the customer gets
-   two replies: one for the picture, one for the words.
-
-   The image handler waits briefly for a caption; the text handler
-   hands its message over and stays quiet if an image is mid-flight.
-
-   NOTE: this state is in process memory. On Vercel, separate
-   invocations may land on different instances, so this is
-   best-effort until conversation state moves to a real store.
-   ───────────────────────────────────────────────────────────── */
-const imageInFlight = new Map<string, number>();
-const pendingCaption = new Map<string, string>();
-const CAPTION_WAIT_MS = 2000;
+// How long to wait for a caption to arrive as its own webhook request.
+const CAPTION_WAIT_MS = 2500;
 
 /* ─────────────────────────────────────────────────────────────
    Webhook verification
@@ -76,17 +65,9 @@ export async function POST(req: Request) {
     syncIfStale().catch(() => {});
 
     for (const entry of body.entry ?? []) {
-      const events = entry.messaging ?? [];
-
-      // Same-batch case: a photo and caption occasionally do arrive
-      // together. Cheap to check, and saves the 2s wait.
-      const batchHasText = events.some(
-        (e: any) => e.message?.text && !e.message?.is_echo
-      );
-
-      for (const event of events) {
+      for (const event of entry.messaging ?? []) {
         try {
-          await handleEvent(event, batchHasText);
+          await handleEvent(event);
         } catch (err) {
           console.error('Event failed:', err);
         }
@@ -97,7 +78,7 @@ export async function POST(req: Request) {
   return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
-async function handleEvent(event: any, batchHasText = false) {
+async function handleEvent(event: any) {
   /* ── Images ──────────────────────────────────────────────
      Not every image is a payment slip. A customer sending a
      product photo to ask "do you have this?" must not be told
@@ -110,9 +91,10 @@ async function handleEvent(event: any, batchHasText = false) {
   if (images.length > 0 && !event.message?.is_echo) {
     const senderId = event.sender.id;
     const url = images[0].payload?.url;
-    const thai = (getLang(senderId) ?? 'th') === 'th';
+    const thai = ((await getLang(senderId)) ?? 'th') === 'th';
 
-    imageInFlight.set(senderId, Date.now());
+    // Shared flag, so the text handler on ANOTHER instance can see it.
+    await markImageInFlight(senderId);
 
     try {
       // Classify first — a slip must never wait, and must never be
@@ -124,7 +106,7 @@ async function handleEvent(event: any, batchHasText = false) {
       );
 
       if (kind === 'slip') {
-        takeOver(senderId);
+        await takeOver(senderId);
         console.log(`[SLIP URL] ${url}`);
         await sendMessage(
           senderId,
@@ -135,14 +117,10 @@ async function handleEvent(event: any, batchHasText = false) {
         return;
       }
 
-      // Give a caption time to arrive as its own webhook delivery.
-      // Two seconds is invisible to a customer and removes the
-      // duplicate reply.
-      if (!batchHasText) {
-        await new Promise(r => setTimeout(r, CAPTION_WAIT_MS));
-      }
-      const caption = pendingCaption.get(senderId) ?? '';
-      pendingCaption.delete(senderId);
+      // Give a caption time to arrive as its own webhook request.
+      await new Promise(r => setTimeout(r, CAPTION_WAIT_MS));
+      const caption = await takePendingCaption(senderId);
+      if (caption) console.log(`[CAPTION] ${senderId} — "${caption}"`);
 
       if (kind === 'product' && description) {
         // The vision model describes; the chat model matches against
@@ -154,12 +132,12 @@ async function handleEvent(event: any, batchHasText = false) {
             thai
           );
           if (suggestion) {
-            addTurn(
+            await addTurn(
               senderId,
               'user',
               `[photo: ${description}]${caption ? ` ${caption}` : ''}`
             );
-            addTurn(senderId, 'model', suggestion);
+            await addTurn(senderId, 'model', suggestion);
             await sendMessage(senderId, suggestion);
             return;
           }
@@ -176,7 +154,7 @@ async function handleEvent(event: any, batchHasText = false) {
           : 'Thanks for the photo 🙏 Could you tell me which item you are looking for?'
       );
     } finally {
-      imageInFlight.delete(senderId);
+      await clearImageInFlight(senderId);
     }
     return;
   }
@@ -187,14 +165,14 @@ async function handleEvent(event: any, batchHasText = false) {
   if (event.message.is_echo) {
     const customerId = event.recipient.id;
 
-    if (wasBotSent(event.message.text)) return;
+    if (await wasBotSent(event.message.text)) return;
 
     if (event.message.text.startsWith('/bot')) {
-      releaseToBot(customerId);
-      clearOrdered(customerId);       // allow a new order on this thread
+      await releaseToBot(customerId);
+      await clearOrdered(customerId);   // allow a new order on this thread
       console.log(`[BOT RESUMED] ${customerId}`);
     } else {
-      takeOver(customerId);
+      await takeOver(customerId);
       console.log(`[HUMAN MODE] ${customerId} — you replied manually`);
     }
     return;
@@ -204,27 +182,26 @@ async function handleEvent(event: any, batchHasText = false) {
   const text = event.message.text;
   const mid = event.message.mid;
 
-  if (handled.has(mid)) {
+  // Atomic claim: the first invocation to see this message wins,
+  // even across instances. Meta retries can no longer duplicate an order.
+  if (!(await claimMessage(mid))) {
     console.log('Duplicate, skipping:', mid);
     return;
   }
-  handled.add(mid);
 
   console.log(`Message from ${senderId}: ${text}`);
 
-  // Language is fixed on first contact. Per-message detection would
-  // flip a Thai customer to English the moment they type "ok".
-  setLang(senderId, detectLang(text));
-  const thai = (getLang(senderId) ?? 'th') === 'th';
+  await setLang(senderId, detectLang(text));
+  const thai = ((await getLang(senderId)) ?? 'th') === 'th';
 
-  /* ── Caption for an image we're already answering ─────────
+  /* ── Caption for an image being answered right now ────────
      Hand the text to the image handler and stay silent, so the
-     customer gets one reply instead of two.
+     customer gets one reply instead of two. The flag lives in
+     Redis, so this works across instances.
      ─────────────────────────────────────────────────────── */
-  const inFlight = imageInFlight.get(senderId);
-  if (inFlight !== undefined && Date.now() - inFlight < CAPTION_WAIT_MS + 1000) {
-    pendingCaption.set(senderId, text);
-    addTurn(senderId, 'user', text);
+  if (await isImageInFlight(senderId)) {
+    await setPendingCaption(senderId, text);
+    await addTurn(senderId, 'user', text);
     console.log(`[CAPTION] ${senderId} — folded into the image reply`);
     return;
   }
@@ -233,8 +210,8 @@ async function handleEvent(event: any, batchHasText = false) {
      Checked BEFORE analysis — no point spending an API call on a
      conversation the bot isn't allowed to answer.
      ─────────────────────────────────────────────────────── */
-  if (isTakenOver(senderId)) {
-    addTurn(senderId, 'user', text);
+  if (await isTakenOver(senderId)) {
+    await addTurn(senderId, 'user', text);
     console.log(`[HUMAN MODE] ${senderId} — bot silent`);
     return;
   }
@@ -264,18 +241,16 @@ async function handleEvent(event: any, batchHasText = false) {
      bare handover message.
 
      Order number and total come from CODE, never the model.
-     hasOrdered() stops a second row on the same thread — a
-     customer agreeing twice must not be charged twice.
      ─────────────────────────────────────────────────────── */
   if (
     (a.intent === 'confirm_order' || a.intent === 'payment') &&
     a.confirmed &&
     a.items.length > 0 &&
-    !hasOrdered(senderId)
+    !(await hasOrdered(senderId))
   ) {
-    markOrdered(senderId);
-    takeOver(senderId);
-    addTurn(senderId, 'user', text);
+    await markOrdered(senderId);
+    await takeOver(senderId);
+    await addTurn(senderId, 'user', text);
 
     const orderNo = await saveOrder(senderId, a);
     console.log(`[ORDER] ${orderNo} — ${a.total} THB — ${a.items.length} item(s)`);
@@ -294,8 +269,8 @@ async function handleEvent(event: any, batchHasText = false) {
      customer's money to a stranger.
      ─────────────────────────────────────────────────────── */
   if (a.tier === 3) {
-    takeOver(senderId);
-    addTurn(senderId, 'user', text);
+    await takeOver(senderId);
+    await addTurn(senderId, 'user', text);
     console.warn(`[TIER 3] ${senderId} — ${a.intent}: ${a.tierReason}`);
 
     let msg: string;
@@ -347,7 +322,8 @@ function orderConfirmation(orderNo: string, total: number, thai: boolean): strin
    Sending
    ───────────────────────────────────────────────────────────── */
 async function sendMessage(recipientId: string, text: string) {
-  markBotSent(text);
+  // Record before sending so we recognise the echo when it returns.
+  await markBotSent(text);
 
   const res = await fetch('https://graph.instagram.com/v23.0/me/messages', {
     method: 'POST',

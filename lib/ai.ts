@@ -9,6 +9,7 @@
 
 import { getFormattedCatalog } from './catalog';
 import { getHistory, addTurn, getLang, setLang } from './memory';
+import { stripMarkdown } from './image';
 
 const API_URL = 'https://api.opentyphoon.ai/v1/chat/completions';
 const MODEL = process.env.TYPHOON_MODEL ?? 'typhoon-v2.5-30b-a3b-instruct';
@@ -164,27 +165,34 @@ ${catalogText}
 === OUTPUT ===
 - Output ONLY the message the customer should see.
 - Never include system notes, tier labels, internal reasoning, or
-  debugging markers in your reply. Those are handled elsewhere.`;
+  debugging markers in your reply. Those are handled elsewhere.
+
+=== FORMATTING — this is an Instagram DM, PLAIN TEXT ONLY ===
+- NEVER use markdown. No [text](url), no **bold**, no # headings,
+  no tables. The customer sees the raw characters.
+- Write links as a bare URL on its own line:
+    https://www.instagram.com/p/XXXX/
+- NEVER write internal labels such as "[สินค้าที่ 5]" or "[Product 3]".
+  Those are catalog markers, not product names. Use the real name.`;
 }
 
 /** Backstop for artefacts the prompt doesn't reliably prevent. */
 function clean(text: string): string {
-  return text
-    .replace(/<think>[\s\S]*?<\/think>/g, '')
-    // Strip any internal marker that leaks into customer-facing text.
-    // These must never reach a customer.
-    .replace(/\[SYSTEM NOTE:[^\]]*\]/gi, '')
-    .replace(/\[Tier:[^\]]*\]/gi, '')
-    .trim();
+  return stripMarkdown(
+    text
+      // Internal telemetry must never reach a customer.
+      .replace(/\[SYSTEM NOTE:[^\]]*\]/gi, '')
+      .replace(/\[Tier:[^\]]*\]/gi, '')
+  );
 }
 
 export async function getAIReply(senderId: string, text: string): Promise<string> {
-  setLang(senderId, detectLang(text));
-  const lang = getLang(senderId) ?? 'th';
+  await setLang(senderId, detectLang(text));
+  const lang = (await getLang(senderId)) ?? 'th';
 
   try {
     const catalogText = await getFormattedCatalog();
-    const history = getHistory(senderId);
+    const history = await getHistory(senderId);
 
     const messages = [
       { role: 'system', content: buildSystemPrompt(catalogText) },
@@ -225,8 +233,8 @@ export async function getAIReply(senderId: string, text: string): Promise<string
     const reply = clean(data.choices?.[0]?.message?.content ?? '');
     if (!reply) throw new Error('empty reply');
 
-    addTurn(senderId, 'user', text);
-    addTurn(senderId, 'model', reply);
+    await addTurn(senderId, 'user', text);
+    await addTurn(senderId, 'model', reply);
 
     return reply;
   } catch (err) {
