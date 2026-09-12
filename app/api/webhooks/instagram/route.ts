@@ -91,7 +91,6 @@ async function handleEvent(event: any) {
   if (images.length > 0 && !event.message?.is_echo) {
     const senderId = event.sender.id;
     const url = images[0].payload?.url;
-    const thai = ((await getLang(senderId)) ?? 'th') === 'th';
 
     // Shared flag, so the text handler on ANOTHER instance can see it.
     await markImageInFlight(senderId);
@@ -108,9 +107,10 @@ async function handleEvent(event: any) {
       if (kind === 'slip') {
         await takeOver(senderId);
         console.log(`[SLIP URL] ${url}`);
+        const slipThai = ((await getLang(senderId)) ?? 'th') === 'th';
         await sendMessage(
           senderId,
-          thai
+          slipThai
             ? 'ได้รับสลิปแล้วค่ะ 🙏 เดี๋ยวแอดมินตรวจสอบและยืนยันให้นะคะ'
             : 'Slip received 🙏 Our admin will verify and confirm shortly.'
         );
@@ -121,6 +121,12 @@ async function handleEvent(event: any) {
       await new Promise(r => setTimeout(r, CAPTION_WAIT_MS));
       const caption = await takePendingCaption(senderId);
       if (caption) console.log(`[CAPTION] ${senderId} — "${caption}"`);
+
+      // Language must be decided AFTER the caption arrives. A photo
+      // carries no language signal, so an English caption was
+      // previously ignored and every photo reply came back in Thai.
+      if (caption) await setLang(senderId, detectLang(caption));
+      const thai = ((await getLang(senderId)) ?? 'th') === 'th';
 
       if (kind === 'product' && description) {
         // The vision model describes; the chat model matches against

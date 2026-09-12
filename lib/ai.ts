@@ -148,7 +148,12 @@ ${catalogText}
 - Always show the multiplication, e.g. 590 x 2 = 1180.
 - Never summarise until all four details are known.
 - Never mix two languages in one message.
-- Thai product names may stay in Thai even in an English reply.
+- In an ENGLISH reply, write each product as the English name followed
+  by the Thai name in brackets, e.g.
+    Oversized Linen Shirt (เสื้อเชิ้ตโอเวอร์ไซส์ ผ้าลินิน)
+  The customer needs the English to understand it and the Thai to
+  match it against the Instagram post.
+- In an ENGLISH reply, write prices as "890 THB", not "890 บาท".
 
 === AFTER THE CUSTOMER CONFIRMS ===
 - Reply briefly, conveying (1) the order is received and (2) payment
