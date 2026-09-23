@@ -17,11 +17,13 @@
 // honest fix is to cancel and write a new order so both the mistake
 // and the correction stay visible.
 //
-// It also does not enforce an order of statuses. The dashboard only
-// offers the sensible moves, but the route accepts any of the four,
-// because "I marked that paid by mistake" has to be undoable and a
-// server that refuses to go backwards turns a mis-tap into a support
-// call.
+// It also cannot skip a step. An order can only move where
+// canMove() in lib/orders.ts allows, so nothing can mark a parcel
+// shipped while it is still awaiting payment — the rule lives in
+// code, not in which buttons the dashboard happens to draw. Moving
+// BACKWARDS is still allowed, because "I marked that paid by
+// mistake" has to be undoable and a server that refuses to reverse a
+// mis-tap turns it into a support call.
 //
 // ─────────────────────────────────────────────────────────────
 // THE ORDER IS SAVED BEFORE ANYTHING ELSE IS ATTEMPTED
@@ -41,7 +43,7 @@
 // ─────────────────────────────────────────────────────────────
 
 import { and, eq } from 'drizzle-orm';
-import { updateOrder, isOrderStatus } from '../../../lib/orders';
+import { updateOrder, isOrderStatus, canMove, getOrder } from '../../../lib/orders';
 import { sendDM, threadLang, shippedMessage } from '../../../lib/messenger';
 import { logMessage, setHandover } from '../../../lib/conversations';
 import { releaseToBot, clearOrdered } from '../../../lib/memory';
@@ -91,9 +93,31 @@ export async function PATCH(req: Request) {
       return Response.json({ ok: false, error: 'nothing to update' }, { status: 400 });
     }
 
-    // updateOrder scopes the UPDATE to this shop as well as the order
-    // number, so a guessed order number from another shop matches
-    // nothing rather than being edited.
+    // Read the order first, so an illegal move is refused before
+    // anything is written. Both reads are scoped to this shop, so a
+    // guessed order number from another shop matches nothing rather
+    // than being read or edited.
+    const current = await getOrder(orderNo);
+    if (!current) {
+      return Response.json({ ok: false, error: 'not found' }, { status: 404 });
+    }
+
+    if (patch.status !== undefined && !canMove(current.status, patch.status)) {
+      // 409: the request is well formed, but the order is not in a
+      // state where this move makes sense. The message says both
+      // ends, because "cannot do that" with no reason is the kind of
+      // error that costs an afternoon.
+      return Response.json(
+        {
+          ok: false,
+          error: `cannot move an order from ${current.status} to ${patch.status}`,
+          from: current.status,
+          to: patch.status,
+        },
+        { status: 409 }
+      );
+    }
+
     const order = await updateOrder(orderNo, patch);
     if (!order) {
       return Response.json({ ok: false, error: 'not found' }, { status: 404 });

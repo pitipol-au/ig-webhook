@@ -182,32 +182,59 @@ async function handleEvent(event: any) {
         lang: thai ? 'th' : 'en',
       });
 
-      if (kind === 'product' && description) {
-        // The vision model describes; the chat model matches against
-        // the real catalog. Splitting them means a weak description
-        // can't invent stock we don't have.
+      /* A photo with no words is still a question: "do you have
+         this?". So ANY image that is not a payment slip is matched
+         against the catalogue — including one the classifier was
+         unsure about. The vision model describes; the chat model
+         matches against the real catalogue; and findSimilar only
+         reports a match when the reply names a product that exists.
+
+         Two outcomes, both of them an answer:
+           matched  -> the closest things the shop really has
+           no match -> "we don't carry anything like this", and the
+                       thread is flagged so the owner can follow up.
+         Asking the customer to type the item name instead is the one
+         thing we do not do — they already told us, with a picture. */
+      if (description) {
         try {
-          const suggestion = await findSimilar(
+          const match = await findSimilar(
             caption ? `${description}\n\nCustomer also said: ${caption}` : description,
             thai
           );
-          if (suggestion) {
-            await addTurn(
-              senderId,
-              'user',
-              `[photo: ${description}]${caption ? ` ${caption}` : ''}`
-            );
-            await addTurn(senderId, 'model', suggestion);
-            await sendMessage(senderId, suggestion);
-            await logMessage({ customerId: senderId, role: 'bot', text: suggestion });
-            return;
+
+          await addTurn(
+            senderId,
+            'user',
+            `[photo: ${description}]${caption ? ` ${caption}` : ''}`
+          );
+          await addTurn(senderId, 'model', match.reply);
+          await sendMessage(senderId, match.reply);
+
+          if (match.matched) {
+            await logMessage({ customerId: senderId, role: 'bot', text: match.reply });
+          } else {
+            // Tier 2: answered, and put on the owner's follow-up list.
+            // A photo of something we do not sell is demand the shop
+            // cannot fill — worth seeing on the dashboard rather than
+            // losing in a thread.
+            console.log(`[NO MATCH] ${senderId} — ${description.slice(0, 80)}`);
+            await logMessage({
+              customerId: senderId,
+              role: 'bot',
+              text: match.reply,
+              intent: 'other',
+              tier: 2,
+              tierReason: 'sent a photo of something the catalogue does not cover',
+            });
           }
+          return;
         } catch (err) {
           console.error('Similar-item match failed:', err);
         }
       }
 
-      // Unrecognised image, or matching failed.
+      // Only reached when the image could not be described at all, or
+      // matching threw. Then asking is the honest thing to do.
       const fallback = thai
         ? 'ได้รับรูปแล้วค่ะ 🙏 รบกวนบอกชื่อสินค้าที่สนใจได้ไหมคะ'
         : 'Thanks for the photo 🙏 Could you tell me which item you are looking for?';

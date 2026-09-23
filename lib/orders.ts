@@ -102,6 +102,53 @@ export function isOrderStatus(v: unknown): v is OrderStatus {
   return typeof v === 'string' && (ORDER_STATUSES as readonly string[]).includes(v);
 }
 
+/* ─────────────────────────────────────────────────────────────
+   WHICH MOVES ARE ALLOWED
+
+   The dashboard only offers the sensible next move, so this could
+   not be reached by tapping. It is here because the rule belongs in
+   code, not in the shape of a button: nothing should be able to mark
+   a parcel shipped before a person has confirmed the money arrived.
+
+   Going backwards IS allowed, deliberately. "I tapped that by
+   mistake" has to be undoable, and a server that refuses to reverse
+   a mis-tap turns it into a support call. What is refused is only
+   skipping a step forward:
+
+     awaiting payment  ->  paid | cancelled
+     paid              ->  shipped | awaiting payment (undo) | cancelled
+     shipped           ->  shipped (edit tracking) | paid (undo)
+     cancelled         ->  awaiting payment (reopen)
+
+   Not listed, and therefore refused: awaiting payment -> shipped,
+   cancelled -> paid or shipped.
+   ───────────────────────────────────────────────────────────── */
+
+const ALLOWED_MOVES: Record<OrderStatus, readonly OrderStatus[]> = {
+  pending_payment: ['pending_payment', 'paid', 'cancelled'],
+  paid: ['paid', 'shipped', 'pending_payment', 'cancelled'],
+  shipped: ['shipped', 'paid'],
+  cancelled: ['cancelled', 'pending_payment'],
+};
+
+/** True if an order in `from` may be moved to `to`. */
+export function canMove(from: OrderStatus, to: OrderStatus): boolean {
+  return ALLOWED_MOVES[from].includes(to);
+}
+
+/** One order by its number, scoped to this shop. Null if there is no
+ *  such order here — a guessed number from another shop finds
+ *  nothing rather than leaking a row. */
+export async function getOrder(orderNo: string): Promise<Order | null> {
+  const shopId = await getShopId();
+  const [row] = await db
+    .select()
+    .from(orders)
+    .where(and(eq(orders.shopId, shopId), eq(orders.orderNo, orderNo)))
+    .limit(1);
+  return row ?? null;
+}
+
 /**
  * Move an order along, or attach a slip or tracking number.
  *
